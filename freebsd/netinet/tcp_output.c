@@ -178,6 +178,12 @@ cc_after_idle(struct tcpcb *tp)
 		CC_ALGO(tp)->after_idle(tp->ccv);
 }
 
+extern int ff_tcp_output(void* tp);
+int ff_tcp_output(void* tp)
+{
+	return tcp_output((struct tcpcb *)tp);
+}
+
 /*
  * Tcp output routine: figure out what should be sent and send it.
  */
