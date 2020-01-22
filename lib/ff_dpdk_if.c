@@ -359,7 +359,7 @@ init_mem_pool(void)
     return 0;
 }
 
-static struct rte_ring *
+struct rte_ring *
 create_ring(const char *name, unsigned count, int socket_id, unsigned flags)
 {
     struct rte_ring *ring;
@@ -1603,12 +1603,13 @@ main_loop(void *arg)
         process_msg_ring(qconf->proc_id);
 
         div_tsc = rte_rdtsc();
-
+/*****
         if (likely(lr->loop != NULL && (!idle || cur_tsc - usch_tsc >= drain_tsc))) {
             usch_tsc = cur_tsc;
             lr->loop(lr->arg);
         }
-
+*****/
+        ff_proc_down_ring();
         idle_sleep_tsc = rte_rdtsc();
         if (likely(idle && idle_sleep)) {
             usleep(idle_sleep);

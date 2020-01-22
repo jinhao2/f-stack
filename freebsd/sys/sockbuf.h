@@ -84,7 +84,8 @@ struct	xsockbuf {
  * (a) locked by SOCKBUF_LOCK().
  */
 struct	sockbuf {
-	struct	selinfo sb_sel;	/* process selecting read/write */
+	//struct	selinfo sb_sel;	/* process selecting read/write */
+	int		fd_wait;	/* socket fd waiting input data */
 	struct	mtx sb_mtx;	/* sockbuf lock */
 	struct	sx sb_sx;	/* prevent I/O interlacing */
 	short	sb_state;	/* (a) socket state on sockbuf */
@@ -109,8 +110,13 @@ struct	sockbuf {
 	short	sb_flags;	/* (a) flags, see below */
 	int	(*sb_upcall)(struct socket *, void *, int); /* (a) */
 	void	*sb_upcallarg;	/* (a) */
+#ifndef FSTACK
 	TAILQ_HEAD(, kaiocb) sb_aiojobq; /* (a) pending AIO ops */
 	struct	task sb_aiotask; /* AIO task */
+#else
+	volatile u_long	sb_input_nb;		/* input bytes number */
+	volatile u_long	sb_recvout_nb;		/* recved out bytes number */
+#endif
 };
 
 #ifdef _KERNEL
