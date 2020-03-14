@@ -23,13 +23,14 @@ F-STACK_VERSION=1.20
 
 HOST_OS:=$(shell uname -s)
 
-#DEBUG=-O0 -gdwarf-2 -g3 -Wno-format-truncation
+DEBUG=-O0 -gdwarf-2 -g3 -Wno-format-truncation
 
 FF_KNI=1
 #FF_NETGRAPH=1
 #FF_IPFW=1
 #FF_USE_PAGE_ARRAY=1
-FF_INET6=1
+FF_USE_DPDK_MBUF=1
+##FF_INET6=1
 
 
 include ${TOPDIR}/mk/kern.pre.mk
@@ -86,6 +87,10 @@ endif
 
 ifdef FF_USE_PAGE_ARRAY
 HOST_CFLAGS+= -DFF_USE_PAGE_ARRAY
+endif
+
+ifdef FF_USE_DPDK_MBUF
+HOST_CFLAGS+= -DFF_USE_DPDK_MBUF
 endif
 
 ifdef FF_INET6
@@ -199,7 +204,8 @@ FF_SRCS+=                     \
 	ff_subr_prf.c         \
 	ff_vfs_ops.c          \
 	ff_veth.c             \
-	ff_route.c
+	ff_route.c            \
+    ff_mbuf_api.c
 
 ifdef FF_NETGRAPH
 FF_SRCS+=                   \
@@ -214,7 +220,8 @@ FF_HOST_SRCS+=              \
 	ff_dpdk_if.c        \
 	ff_dpdk_pcap.c      \
 	ff_epoll.c          \
-	ff_init.c	
+	ff_init.c			\
+	ff_rte_api.c
 
 ifdef FF_KNI
 FF_HOST_SRCS+=              \

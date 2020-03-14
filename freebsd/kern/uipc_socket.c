@@ -360,6 +360,8 @@ SYSCTL_PROC(_kern_ipc, OID_AUTO, maxsockets, CTLTYPE_INT|CTLFLAG_RW,
     &maxsockets, 0, sysctl_maxsockets, "IU",
     "Maximum number of sockets available");
 
+extern struct mbuf* ff_uiotombuf(struct uio *uio, int how, int len, int align, int flags);
+
 /*
  * Socket operation routines.  These routines are called by the routines in
  * sys_socket.c or from a system process, and implement the semantics of
@@ -1331,7 +1333,7 @@ restart:
 				 * is a workaround to prevent protocol send
 				 * methods to panic.
 				 */
-				top = m_uiotombuf(uio, M_WAITOK, space,
+				top = ff_uiotombuf(uio, M_WAITOK, space,
 				    (atomic ? max_hdr : 0),
 				    (atomic ? M_PKTHDR : 0) |
 				    ((flags & MSG_EOR) ? M_EOR : 0));

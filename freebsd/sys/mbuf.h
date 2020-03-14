@@ -69,7 +69,7 @@ SDT_PROBE_DECLARE(sdt, , , m__free);
 SDT_PROBE_DECLARE(sdt, , , m__freem);
 
 #endif /* _KERNEL */
-
+#include "ff_mbuf_api.h"
 /*
  * Mbufs are of a single size, MSIZE (sys/param.h), which includes overhead.
  * An mbuf may add a single "mbuf cluster" of size MCLBYTES (also in

@@ -308,73 +308,6 @@ int    ff_mem_free_addr(void *p)
     return 0;
 }
 
-static inline void ff_offload_set(struct ff_dpdk_if_context *ctx, void *m, struct rte_mbuf *head)
-{
-    void                    *data = NULL;
-    struct ff_tx_offload     offload = {0};
-    
-    ff_mbuf_tx_offload(m, &offload);
-    data = rte_pktmbuf_mtod(head, void*);
-
-    if (offload.ip_csum) {
-        /* ipv6 not supported yet */
-        struct ipv4_hdr *iph;
-        int iph_len;
-        iph = (struct ipv4_hdr *)(data + ETHER_HDR_LEN);
-        iph_len = (iph->version_ihl & 0x0f) << 2;
-
-        head->ol_flags |= PKT_TX_IP_CKSUM | PKT_TX_IPV4;
-        head->l2_len = ETHER_HDR_LEN;
-        head->l3_len = iph_len;
-    }
-
-    if (ctx->hw_features.tx_csum_l4) {
-        struct ipv4_hdr *iph;
-        int iph_len;
-        iph = (struct ipv4_hdr *)(data + ETHER_HDR_LEN);
-        iph_len = (iph->version_ihl & 0x0f) << 2;
-
-        if (offload.tcp_csum) {
-            head->ol_flags |= PKT_TX_TCP_CKSUM;
-            head->l2_len = ETHER_HDR_LEN;
-            head->l3_len = iph_len;
-        }
-
-       /*
-         *  TCP segmentation offload.
-         *
-         *  - set the PKT_TX_TCP_SEG flag in mbuf->ol_flags (this flag
-         *    implies PKT_TX_TCP_CKSUM)
-         *  - set the flag PKT_TX_IPV4 or PKT_TX_IPV6
-         *  - if it's IPv4, set the PKT_TX_IP_CKSUM flag and
-         *    write the IP checksum to 0 in the packet
-         *  - fill the mbuf offload information: l2_len,
-         *    l3_len, l4_len, tso_segsz
-         *  - calculate the pseudo header checksum without taking ip_len
-         *    in account, and set it in the TCP header. Refer to
-         *    rte_ipv4_phdr_cksum() and rte_ipv6_phdr_cksum() that can be
-         *    used as helpers.
-         */
-        if (offload.tso_seg_size) {
-            struct tcp_hdr *tcph;
-            int tcph_len;
-            tcph = (struct tcp_hdr *)((char *)iph + iph_len);
-            tcph_len = (tcph->data_off & 0xf0) >> 2;
-            tcph->cksum = rte_ipv4_phdr_cksum(iph, PKT_TX_TCP_SEG);
-
-            head->ol_flags |= PKT_TX_TCP_SEG;
-            head->l4_len = tcph_len;
-            head->tso_segsz = offload.tso_seg_size;
-        }
-
-        if (offload.udp_csum) {
-            head->ol_flags |= PKT_TX_UDP_CKSUM;
-            head->l2_len = ETHER_HDR_LEN;
-            head->l3_len = iph_len;
-        }
-    }
-}
-
 // create rte_buf refer to data which is transmit from bsd stack by EXT_CLUSTER.
 static inline struct rte_mbuf*     ff_extcl_to_rte(void *m )
 {
@@ -436,7 +369,7 @@ static inline struct rte_mbuf*     ff_bsd_to_rte(void *m, int total)
     
     return p_head;
 }
-
+extern void ff_offload_set(struct ff_dpdk_if_context *ctx, void *m, struct rte_mbuf *head);
 int ff_if_send_onepkt(struct ff_dpdk_if_context *ctx, void *m, int total)
 {
     struct rte_mbuf *head = NULL;

@@ -296,7 +296,8 @@ CTASSERT((((MSIZE - 1) ^ MSIZE) + 1) >> 1 == MSIZE);
 static void
 mbuf_init(void *dummy)
 {
-
+	printf("mbuf_init return\n");
+	return ;
 	/*
 	 * Configure UMA zones for Mbufs, Clusters, and Packets.
 	 */
@@ -731,7 +732,8 @@ mb_free_ext(struct mbuf *m)
 int
 m_clget(struct mbuf *m, int how)
 {
-
+	printf( "file %s, func %s invalid way.\n", __FILE__, __func__ );
+	return -1;
 	KASSERT((m->m_flags & M_EXT) == 0, ("%s: mbuf %p has M_EXT",
 	    __func__, m));
 	m->m_ext.ext_buf = (char *)NULL;
@@ -758,6 +760,8 @@ m_clget(struct mbuf *m, int how)
 void *
 m_cljget(struct mbuf *m, int how, int size)
 {
+	printf( "file %s, func %s invalid way.\n", __FILE__, __func__ );
+	return NULL;
 	uma_zone_t zone;
 	void *retval;
 

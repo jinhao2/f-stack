@@ -70,6 +70,7 @@ struct ff_veth_softc {
 
     struct ff_dpdk_if_context *host_ctx;
 };
+void ff_mbuf_ext_free(struct mbuf *m, void *arg1, void *arg2);
 
 static int
 ff_veth_config(struct ff_veth_softc *sc, struct ff_port_cfg *cfg)
@@ -174,8 +175,7 @@ ff_mbuf_free(void *m)
     m_freem((struct mbuf *)m);
 }
 
-static void
-ff_mbuf_ext_free(struct mbuf *m, void *arg1, void *arg2)
+void ff_mbuf_ext_free(struct mbuf *m, void *arg1, void *arg2)
 {
     ff_dpdk_pktmbuf_free(arg1);
 }

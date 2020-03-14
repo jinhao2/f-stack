@@ -57,13 +57,6 @@ extern "C" {
 #define MAX_TX_QUEUE_PER_PORT RTE_MAX_ETHPORTS
 #define MAX_RX_QUEUE_PER_PORT 128
 
-struct ff_dpdk_if_context {
-    void *sc;
-    void *ifp;
-    uint16_t port_id;
-    struct ff_hw_features hw_features;
-} __rte_cache_aligned;
-
 struct mbuf_table {
     uint16_t len;
     struct rte_mbuf *m_table[MAX_PKT_BURST];

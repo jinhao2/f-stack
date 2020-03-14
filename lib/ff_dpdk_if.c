@@ -27,6 +27,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <assert.h>
+#include <stdlib.h>
 
 #include <rte_common.h>
 #include <rte_byteorder.h>
@@ -64,6 +66,8 @@
 #include "ff_api.h"
 #include "ff_memory.h"
 
+#include "ff_rte_api.h"
+
 #ifdef FF_KNI
 #define KNI_MBUF_MAX 2048
 #define KNI_QUEUE_SIZE 2048
@@ -71,6 +75,13 @@
 int enable_kni;
 static int kni_accept;
 #endif
+
+struct ff_dpdk_if_context {
+    void *sc;
+    void *ifp;
+    uint16_t port_id;
+    struct ff_hw_features hw_features;
+} __rte_cache_aligned;
 
 static int numa_on;
 
@@ -125,7 +136,13 @@ static struct ff_dpdk_if_context *veth_ctx[RTE_MAX_ETHPORTS];
 
 static struct ff_top_args ff_top_status;
 static struct ff_traffic_args ff_traffic;
+
 extern void ff_hardclock(void);
+extern void ff_offload_set(struct ff_dpdk_if_context *ctx, void *m, struct rte_mbuf *head);
+extern inline struct rte_mbuf* ff_mbuf2_rtembuf( void* m );
+extern void* ff_embed_mhdr(void* pkt, unsigned short total, void *data, unsigned short len, unsigned char rx_csum);
+extern void* ff_embed_mbuf(void *pkt, void *data, unsigned short len, void* prev);
+extern void* ff_m_chain(void* m);
 
 static void
 ff_hardclock_job(__rte_unused struct rte_timer *timer,
@@ -807,6 +824,8 @@ init_clock(void)
 int
 ff_dpdk_init(int argc, char **argv)
 {
+    FILE* log_fh = NULL;
+    
     if (ff_global_cfg.dpdk.nb_procs < 1 ||
         ff_global_cfg.dpdk.nb_procs > RTE_MAX_LCORE ||
         ff_global_cfg.dpdk.proc_id >= ff_global_cfg.dpdk.nb_procs ||
@@ -816,6 +835,11 @@ ff_dpdk_init(int argc, char **argv)
             ff_global_cfg.dpdk.proc_id);
         exit(1);
     }
+
+    log_fh = fopen("./test.log","w+");
+    if(log_fh == NULL)
+        return -1;
+    rte_openlog_stream(log_fh);
 
     int ret = rte_eal_init(argc, argv);
     if (ret < 0) {
@@ -847,6 +871,10 @@ ff_dpdk_init(int argc, char **argv)
     ff_mmap_init();
 #endif
 
+#ifdef FF_USE_DPDK_MBUF
+		ff_mbuf_pool_init(argv[1]);
+#endif
+
     ret = init_port_start();
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "init_port_start failed\n");
@@ -870,7 +898,24 @@ ff_veth_input(const struct ff_dpdk_if_context *ctx, struct rte_mbuf *pkt)
 
     void *data = rte_pktmbuf_mtod(pkt, void*);
     uint16_t len = rte_pktmbuf_data_len(pkt);
+#ifdef FF_USE_DPDK_MBUF
+	void *hdr = ff_embed_mhdr(pkt, pkt->pkt_len, data, len, rx_csum);
+	if (pkt->ol_flags & PKT_RX_VLAN_STRIPPED) {
+        ff_mbuf_set_vlan_info(hdr, pkt->vlan_tci);
+    }
+    
+	struct rte_mbuf *pn = pkt->next;
+    void *prev = hdr;
+    
+    while(pn != NULL) {
+        data = rte_pktmbuf_mtod(pn, void*);
+        len = rte_pktmbuf_data_len(pn);
 
+        ff_embed_mbuf((void*)pn, data, len, (void*)prev);
+        prev = pn;
+        pn = pn->next; 
+    }
+#else
     void *hdr = ff_mbuf_gethdr(pkt, pkt->pkt_len, data, len, rx_csum);
     if (hdr == NULL) {
         rte_pktmbuf_free(pkt);
@@ -896,6 +941,7 @@ ff_veth_input(const struct ff_dpdk_if_context *ctx, struct rte_mbuf *pkt)
         pn = pn->next;
         prev = mb;
     }
+#endif
 
     ff_veth_process_packet(ctx->ifp, hdr);
 }
@@ -1377,6 +1423,7 @@ send_single_packet(struct rte_mbuf *m, uint8_t port)
     return 0;
 }
 
+int g_ff_send = 0;
 int
 ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m,
     int total)
@@ -1393,6 +1440,21 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m,
     qconf->tx_mbufs[ctx->port_id].len = len;
     return 0;
 #endif
+#ifdef FF_USE_DPDK_MBUF
+    //assert( ff_m_check(m) );
+	struct rte_mbuf* head = (struct rte_mbuf*)ff_m_chain(m);
+    /*ff_mbuf2_rtembuf(m);
+    int pktlen = ff_m_chain(m, &head->pkt_len, &head->nb_segs );
+    if ( pktlen < 0 )
+    {
+        printf("ff_m_chain failed, not header mbuf.");
+        abort();
+        rte_pktmbuf_free(head);
+    }*/
+g_ff_send = head->pkt_len; 
+	ff_offload_set(ctx, m, head);
+#else
+
     struct rte_mempool *mbuf_pool = pktmbuf_pool[lcore_conf.socket_id];
     struct rte_mbuf *head = rte_pktmbuf_alloc(mbuf_pool);
     if (head == NULL) {
@@ -1501,23 +1563,36 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m,
     }
 
     ff_mbuf_free(m);
+#endif
 
     return send_single_packet(head, ctx->port_id);
 }
+
+int tcpout_len =0;
+int unacked_len = 0;
+int so_sndbuf = 0 ;
+int tp_cwnd =0;
+int tp_swnd =0;
+int g_rcvwin =0;
+int gnb_rx = 0;
+int gnb_tx = 0;
+uint64_t cycles = 0;
 
 static int
 main_loop(void *arg)
 {
     struct loop_routine *lr = (struct loop_routine *)arg;
-
+    int nb_rx, nb_tx;
     struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
-    uint64_t prev_tsc, diff_tsc, cur_tsc, usch_tsc, div_tsc, usr_tsc, sys_tsc, end_tsc, idle_sleep_tsc;
-    int i, j, nb_rx, idle;
+    uint64_t  cur_tsc, usch_tsc, div_tsc, usr_tsc, sys_tsc, end_tsc, idle_sleep_tsc, diff_tsc,prev_tsc;
+    int i, j,  idle;
     uint16_t port_id, queue_id;
     struct lcore_conf *qconf;
     uint64_t drain_tsc = 0;
     struct ff_dpdk_if_context *ctx;
 
+    uint64_t prt_tsc = 0;
+    
     if (pkt_tx_delay) {
         drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * pkt_tx_delay;
     }
@@ -1532,7 +1607,7 @@ main_loop(void *arg)
         if (unlikely(freebsd_clock.expire < cur_tsc)) {
             rte_timer_manage();
         }
-
+cycles++;
         idle = 1;
         sys_tsc = 0;
         usr_tsc = 0;
@@ -1547,8 +1622,8 @@ main_loop(void *arg)
                 if (qconf->tx_mbufs[port_id].len == 0)
                     continue;
 
-                idle = 0;
-
+                //idle = 0;
+nb_tx = qconf->tx_mbufs[port_id].len;
                 send_burst(qconf,
                     qconf->tx_mbufs[port_id].len,
                     port_id);
@@ -1557,7 +1632,7 @@ main_loop(void *arg)
 
             prev_tsc = cur_tsc;
         }
-
+gnb_tx +=nb_tx;
         /*
          * Read packet from RX queues
          */
@@ -1574,28 +1649,27 @@ main_loop(void *arg)
 
             process_dispatch_ring(port_id, queue_id, pkts_burst, ctx);
 
-            nb_rx = rte_eth_rx_burst(port_id, queue_id, pkts_burst,
-                MAX_PKT_BURST);
+            nb_rx = rte_eth_rx_burst(port_id, queue_id, pkts_burst,MAX_PKT_BURST);
             if (nb_rx == 0)
                 continue;
-
+gnb_rx += nb_rx;
             idle = 0;
 
             /* Prefetch first packets */
-            for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
+            /*for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
                 rte_prefetch0(rte_pktmbuf_mtod(
                         pkts_burst[j], void *));
-            }
+            }*/
 
             /* Prefetch and handle already prefetched packets */
-            for (j = 0; j < (nb_rx - PREFETCH_OFFSET); j++) {
+            /*for (j = 0; j < (nb_rx - PREFETCH_OFFSET); j++) {
                 rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[
                         j + PREFETCH_OFFSET], void *));
                 process_packets(port_id, queue_id, &pkts_burst[j], 1, ctx, 0);
-            }
+            }*/
 
             /* Handle remaining prefetched packets */
-            for (; j < nb_rx; j++) {
+            for (j=0; j < nb_rx; j++) {
                 process_packets(port_id, queue_id, &pkts_burst[j], 1, ctx, 0);
             }
         }
@@ -1603,19 +1677,25 @@ main_loop(void *arg)
         process_msg_ring(qconf->proc_id);
 
         div_tsc = rte_rdtsc();
-
-        if (likely(lr->loop != NULL && (!idle || cur_tsc - usch_tsc >= drain_tsc))) {
+//if (unlikely(nb_rx>0||nb_tx>0 ) ) 
+if ( tcpout_len<1448 && so_sndbuf>1448  ) 
+{
+    printf("cycles=%lu, tsc=%lu, nb_rx=%d, snd_avail=%d, cwnd=%d, swnd=%d, peer_wnd=%d, tcpoutput_len=%d, unacked_len=%d, nb_tx=%d\n", 
+            cycles,  div_tsc-prt_tsc,  gnb_rx, so_sndbuf, tp_cwnd, tp_swnd, g_rcvwin, tcpout_len, unacked_len, gnb_tx);
+    prt_tsc = div_tsc;
+}
+        if (likely(lr->loop != NULL && (!idle||cur_tsc - usch_tsc >= 10*drain_tsc) )) {
             usch_tsc = cur_tsc;
             lr->loop(lr->arg);
         }
 
-        idle_sleep_tsc = rte_rdtsc();
-        if (likely(idle && idle_sleep)) {
+        end_tsc = idle_sleep_tsc = rte_rdtsc();
+        /*if (likely(idle && idle_sleep)) {
             usleep(idle_sleep);
             end_tsc = rte_rdtsc();
         } else {
             end_tsc = idle_sleep_tsc;
-        }
+        }*/
 
         if (usch_tsc == cur_tsc) {
             usr_tsc = idle_sleep_tsc - div_tsc;
@@ -1747,5 +1827,72 @@ ff_get_tsc_ns()
     uint64_t cur_tsc = rte_rdtsc();
     uint64_t hz = rte_get_tsc_hz();
     return ((double)cur_tsc/(double)hz) * NS_PER_S;
+}
+
+void ff_offload_set(struct ff_dpdk_if_context *ctx, void *m, struct rte_mbuf *head)
+{
+    void                    *data = NULL;
+    struct ff_tx_offload     offload = {0};
+    
+    ff_mbuf_tx_offload(m, &offload);
+    data = rte_pktmbuf_mtod(head, void*);
+
+    if (offload.ip_csum) {
+        /* ipv6 not supported yet */
+        struct ipv4_hdr *iph;
+        int iph_len;
+        iph = (struct ipv4_hdr *)(data + ETHER_HDR_LEN);
+        iph_len = (iph->version_ihl & 0x0f) << 2;
+
+        head->ol_flags |= PKT_TX_IP_CKSUM | PKT_TX_IPV4;
+        head->l2_len = ETHER_HDR_LEN;
+        head->l3_len = iph_len;
+    }
+
+    if (ctx->hw_features.tx_csum_l4) {
+        struct ipv4_hdr *iph;
+        int iph_len;
+        iph = (struct ipv4_hdr *)(data + ETHER_HDR_LEN);
+        iph_len = (iph->version_ihl & 0x0f) << 2;
+
+        if (offload.tcp_csum) {
+            head->ol_flags |= PKT_TX_TCP_CKSUM;
+            head->l2_len = ETHER_HDR_LEN;
+            head->l3_len = iph_len;
+        }
+
+       /*
+         *  TCP segmentation offload.
+         *
+         *  - set the PKT_TX_TCP_SEG flag in mbuf->ol_flags (this flag
+         *    implies PKT_TX_TCP_CKSUM)
+         *  - set the flag PKT_TX_IPV4 or PKT_TX_IPV6
+         *  - if it's IPv4, set the PKT_TX_IP_CKSUM flag and
+         *    write the IP checksum to 0 in the packet
+         *  - fill the mbuf offload information: l2_len,
+         *    l3_len, l4_len, tso_segsz
+         *  - calculate the pseudo header checksum without taking ip_len
+         *    in account, and set it in the TCP header. Refer to
+         *    rte_ipv4_phdr_cksum() and rte_ipv6_phdr_cksum() that can be
+         *    used as helpers.
+         */
+        if (offload.tso_seg_size) {
+            struct tcp_hdr *tcph;
+            int tcph_len;
+            tcph = (struct tcp_hdr *)((char *)iph + iph_len);
+            tcph_len = (tcph->data_off & 0xf0) >> 2;
+            tcph->cksum = rte_ipv4_phdr_cksum(iph, PKT_TX_TCP_SEG);
+
+            head->ol_flags |= PKT_TX_TCP_SEG;
+            head->l4_len = tcph_len;
+            head->tso_segsz = offload.tso_seg_size;
+        }
+
+        if (offload.udp_csum) {
+            head->ol_flags |= PKT_TX_UDP_CKSUM;
+            head->l2_len = ETHER_HDR_LEN;
+            head->l3_len = iph_len;
+        }
+    }
 }
 

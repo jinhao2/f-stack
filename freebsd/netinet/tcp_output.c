@@ -178,6 +178,13 @@ cc_after_idle(struct tcpcb *tp)
 		CC_ALGO(tp)->after_idle(tp->ccv);
 }
 
+
+extern int tcpout_len;
+extern int unacked_len;
+extern int so_sndbuf;
+extern int tp_cwnd ;
+extern int tp_swnd;
+long len = 0;
 /*
  * Tcp output routine: figure out what should be sent and send it.
  */
@@ -185,7 +192,7 @@ int
 tcp_output(struct tcpcb *tp)
 {
 	struct socket *so = tp->t_inpcb->inp_socket;
-	long len, recwin, sendwin;
+	long recwin, sendwin;
 	int off, flags, error = 0;	/* Keep compiler happy */
 	struct mbuf *m;
 	struct ip *ip = NULL;
@@ -1009,6 +1016,12 @@ send:
 	 * be transmitted, and initialize the header from
 	 * the template for sends on this connection.
 	 */
+tcpout_len = len;
+unacked_len = off;
+tp_cwnd = tp->snd_cwnd;
+tp_swnd = tp->snd_wnd;
+so_sndbuf = so->so_snd.sb_ccc;
+
 	if (len) {
 		struct mbuf *mb;
 		u_int moff;
@@ -1028,7 +1041,7 @@ send:
 			m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 		else
 #endif
-			m = m_gethdr(M_NOWAIT, MT_DATA);
+			m = ff_m_gethdr(M_NOWAIT, MT_DATA);
 
 		if (m == NULL) {
 			SOCKBUF_UNLOCK(&so->so_snd);
@@ -1059,6 +1072,7 @@ send:
 				sack_rxmit = 0;
 				goto out;
 			}
+			ff_m_setnext((void*)m, (void*)m->m_next);
 		}
 
 		/*

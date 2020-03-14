@@ -49,6 +49,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/uio.h>
 #include <sys/sdt.h>
 
+#include "ff_mbuf_api.h"
+
 SDT_PROBE_DEFINE5_XLATE(sdt, , , m__init,
     "struct mbuf *", "mbufinfo_t *",
     "uint32_t", "uint32_t",
@@ -467,9 +469,11 @@ m_copym(struct mbuf *m, int off0, int len, int wait)
 			break;
 		}
 		if (copyhdr)
-			n = m_gethdr(wait, m->m_type);
+			//n = m_gethdr(wait, m->m_type);
+			n = ff_m_gethdr(wait, m->m_type);
 		else
-			n = m_get(wait, m->m_type);
+			//n = m_get(wait, m->m_type);
+			n = ff_m_getm(wait, m->m_type);
 		*np = n;
 		if (n == NULL)
 			goto nospace;
@@ -485,7 +489,8 @@ m_copym(struct mbuf *m, int off0, int len, int wait)
 		n->m_len = min(len, m->m_len - off);
 		if (m->m_flags & M_EXT) {
 			n->m_data = m->m_data + off;
-			mb_dupcl(n, m);
+			//mb_dupcl(n, m);
+			ff_m_dupcl(n,m);
 		} else
 			bcopy(mtod(m, caddr_t)+off, mtod(n, caddr_t),
 			    (u_int)n->m_len);
