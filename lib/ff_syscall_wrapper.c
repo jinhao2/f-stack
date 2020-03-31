@@ -25,7 +25,7 @@
  *
  * Derived in part from libplebnet's pn_syscall_wrapper.c.
  */
-
+// functions wrapped bsd's codes, this codes must be compiled in bsd,not support system libs.
 #include <sys/param.h>
 #include <sys/limits.h>
 #include <sys/uio.h>
@@ -54,6 +54,8 @@
 
 #include <net/if.h>
 #include <sys/sockio.h>
+#include <sys/mbuf.h>
+#include <sys/protosw.h>
 
 #include <machine/stdarg.h>
 
@@ -1272,3 +1274,233 @@ kern_fail:
     ff_os_errno(rc);
     return (-1);
 }
+
+extern void ff_soerr_set(void*, uint16_t);
+extern void ff_set_offset(void*, int);
+extern void ff_set_rcvptr(void*, void*);
+
+void* ff_get_rcvbuf_start(void* so);
+void* ff_get_sndbuf_start(void* so);
+void* ff_socreate(int domain, int type, int protocol);
+int ff_soconnect(struct socket* so, void* addr, uint16_t addrlen );
+static inline int tcp_copy_out(void* buf, size_t buflen, struct sockbuf* sb);
+int ff_sorxcopy(void* so, void* i_ptr, char* buf,  int len, int offset);
+int ff_tcp_rxupdate(void* p, int len ,void* p_end);
+void** ff_get_rxbuf_fdinfo(void* so);
+void** ff_get_txbuf_fdinfo(void* so);
+int ff_soclose(void* so);
+
+/*****************************************************
+ * stack get the start ptr of the struct sockbuf.
+ *  
+ * **************************************************/
+void* ff_get_rcvbuf_start(void* so){
+    struct sockbuf* sb = &((struct socket*)so)->so_rcv;
+    return (void*) (sb->sb_mb);
+}
+void* ff_get_sndbuf_start(void* so){
+    struct sockbuf* sb = &((struct socket*)so)->so_snd;
+    return (void*) (sb->sb_mb);
+}
+
+void** ff_get_rxbuf_fdinfo(void* so){
+    return &((struct socket*)so)->so_rcv.sb_fdinfo;
+}
+void** ff_get_txbuf_fdinfo(void* so){
+    return &((struct socket*)so)->so_snd.sb_fdinfo;
+}
+
+void* ff_socreate(int domain, int type, int protocol){
+	struct socket* so = NULL;
+    socreate(domain, &so, type, protocol, curthread->td_ucred, curthread);
+    return (void*)so;
+}
+/*****************************************************
+ * fstack do connect action.
+ * rsp message will be sent after connectting completed.
+ * 
+ * **************************************************/
+int ff_soconnect(struct socket* so, void* addr, uint16_t addrlen ){    
+    struct linux_sockaddr*  l_addr = addr;
+    struct sockaddr_storage bsdaddr;
+    struct sockaddr*        pf = NULL;
+    
+    pf = (struct sockaddr *)&bsdaddr;
+    if (so->so_state & SS_ISCONNECTING) {
+		return (EALREADY);
+    }
+    linux2freebsd_sockaddr(l_addr , addrlen, pf);
+    soconnect(so, pf, curthread);
+    so->so_state &= ~SS_ISCONNECTING;
+    return 0;
+}
+/************************************************
+ * copy data from rx buffer as much as possible.
+ * obsolete.
+ * *********************************************/
+static inline int tcp_copy_out(void* buf, size_t buflen, struct sockbuf* sb){
+    uint32_t o_len = 0;
+	struct uio auio;
+	struct iovec iov;
+	
+	iov.iov_base = buf;
+	iov.iov_len = buflen;
+	auio.uio_iov = &iov;
+	auio.uio_iovcnt = 1;
+	auio.uio_segflg = UIO_USERSPACE;
+	auio.uio_rw = UIO_READ;
+	auio.uio_td = curthread;
+	auio.uio_offset = 0;
+	auio.uio_resid = buflen;
+	
+    m_mbuftouio( &auio, sb->sb_mb, o_len);
+    //m_freem(sbcut_internal(sb, len));   // fstack should do this op.
+    return o_len;
+}
+
+/************************************************
+ * copy data from rx buffer as mush as len. 
+ * Not Support Devided One Mbuf, Maybe tail mbuf can not copied though buf room is not full. --- obsoleted
+ * soreceive_stream() use thread's variable to save the error. 
+ * This function use struct s_fd_sockbuf's so_error to save error.
+ * 
+ * i_ptr:   the rcvbuff's mbuf* .
+ * firstflag ---- 1:this is first read; 
+ * offset:	the offset that has been read out in first mbuf.
+ * out param o_ptr:  the last mbuf that had been copied.
+ * return value: out length.
+ * *********************************************/
+int ff_sorxcopy(void* p_so, void* i_ptr, char* buf,  int len, int offset){
+    struct mbuf* 	mb, *next=NULL;
+    struct sockbuf*	sb = NULL;
+    struct socket*  so = (struct socket*)p_so;
+    int32_t o_len = 0, m_len = 0;
+
+    KASSERT( NULL!=p_so, "ff_so_rxcopy invalid paramters p_so." );
+    KASSERT( NULL!=i_ptr, "ff_so_rxcopy invalid paramters i_ptr." );
+
+	mb = (struct mbuf*)(i_ptr);
+    sb = &so->so_rcv;
+    KASSERT( NULL!=sb, "ff_so_rxcopy invalid paramters o_ptr." );
+    
+    /* We will never ever get anything unless we are or were connected. */
+	if (!(so->so_state & (SS_ISCONNECTED|SS_ISDISCONNECTED))) {
+		ff_soerr_set( sb->sb_fdinfo, (uint16_t)ENOTCONN);
+        return -1;
+	}
+    /* Abort if socket has reported problems. */
+	if (so->so_error) {
+		if (sbavail(sb) > 0)
+			goto deliver;
+		//error = so->so_error;
+        ff_soerr_set( sb->sb_fdinfo, (uint16_t)so->so_error);
+		return -1;
+	}
+
+	/* Door is closed.  Deliver what is left, if any. */
+	if (sb->sb_state & SBS_CANTRCVMORE) {
+		if (sbavail(sb) > 0)
+			goto deliver;
+		else
+			goto out;       // fin
+	}
+
+	/* Socket buffer is empty and we shall not block. */
+	if (sbavail(sb) == 0 ) {
+		ff_soerr_set( sb->sb_fdinfo, (uint16_t)ff_EAGAIN);
+		goto out;
+	}
+
+	/******
+	// copy complete mbufs into buf, without copying part of mbuf.
+    next = (firstflag)? mb : mb->m_next;
+    while( next && o_len<len ){
+        if ( o_len + next->m_len > len ){
+            //memcpy((char*)sockbuf+o_len, mtod(next, void *), len-o_len );
+            //o_len += len-o_len;     
+            //  *o_ff =  len-o_len;
+            break;
+        }
+        memcpy( (char*)buf+o_len, mtod(next, char*), next->m_len );
+        o_len += next->m_len;
+        mb = next;
+        next = next->m_next;
+    }
+    *****/
+deliver:
+    // copy the specific len data from sb_rcv to buf.
+    if ( offset ){
+    	if ( len-o_len > mb->m_len ){
+    	    memcpy( (char*)buf+o_len, mtod(mb, char*)+offset, mb->m_len);
+    	    mb = mb->m_next;
+    	    o_len += mb->m_len;
+    	}
+    	else{
+    	    memcpy( (char*)buf+o_len, mtod(mb, char*)+offset, len-o_len);
+    	    ff_set_offset( sb->sb_fdinfo, offset+len-o_len);
+    	    o_len = len;
+    	}
+    }
+    while( mb && o_len<len ){
+    	if ( len-o_len > mb->m_len ){
+    	    memcpy( (char*)buf+o_len, mtod(mb, char*)+offset, mb->m_len);    	    
+    	    o_len += mb->m_len;
+    	    mb = mb->m_next;
+    	    offset = 0;
+    	}
+    	else{
+    	    memcpy( (char*)buf+o_len, mtod(mb, char*)+offset, len-o_len);
+    	    offset += len-o_len;   	  
+    	    o_len = len;
+    	    break;
+    	}
+    }
+    ff_set_offset( sb->sb_fdinfo, offset);
+    ff_set_rcvptr( sb->sb_fdinfo, mb);
+out:
+    return o_len;
+}
+/************************************************************
+ * fstack update all the rx buffer.
+ * not support  PR_ADDR/MSG_PEEK/MT_CONTROL/MSG_SOCALLBCK/MSG_WAITALL  
+ * mp0 == NULL, 
+ * support MT_OOBDATA 
+ * refer to soreceive_stream() --> tcp_usr_rcvd
+ * ********************************************************/
+int ff_tcp_rxupdate(void* p, int len, void* p_end ){
+    struct socket* so = p;
+    struct sockbuf* sb = &so->so_rcv;
+    int	sock_errno  = 0;
+    /*
+	 * Remove the delivered data from the socket buffer unless we
+	 * were only peeking.
+	 */
+	if ( len < 0 ){
+	    return 0;
+	}
+	
+	sbdrop_locked(sb, len);
+	//sbcut_front_stream(sb, (struct mbuf*)p_end);
+
+	/* Notify protocol that we drained some data. */
+	//VNET_SO_ASSERT(so);
+	sock_errno = (*so->so_proto->pr_usrreqs->pru_rcvd)(so, 0);
+	ff_soerr_set(sb->sb_fdinfo, (uint16_t)sock_errno);
+	
+	//SOCKBUF_LOCK_ASSERT(sb);
+	//SBLASTRECORDCHK(sb);
+	//SBLASTMBUFCHK(sb);
+	//SOCKBUF_UNLOCK(sb);
+	//sbunlock(sb);
+	return 0;
+}
+/************************************************************
+ * fstack close one socket
+ *
+ * ********************************************************/
+int ff_soclose(void* so){
+    return soclose((struct socket*)so);
+}
+
+
+

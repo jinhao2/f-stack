@@ -84,8 +84,9 @@ struct	xsockbuf {
  * (a) locked by SOCKBUF_LOCK().
  */
 struct	sockbuf {
-	//struct	selinfo sb_sel;	/* process selecting read/write */
-	int		fd_wait;	/* socket fd waiting input data */
+//#ifndef FSTACK
+	struct	selinfo sb_sel;	/* process selecting read/write */
+//#endif
 	struct	mtx sb_mtx;	/* sockbuf lock */
 	struct	sx sb_sx;	/* prevent I/O interlacing */
 	short	sb_state;	/* (a) socket state on sockbuf */
@@ -110,13 +111,12 @@ struct	sockbuf {
 	short	sb_flags;	/* (a) flags, see below */
 	int	(*sb_upcall)(struct socket *, void *, int); /* (a) */
 	void	*sb_upcallarg;	/* (a) */
-#ifndef FSTACK
+//#ifndef FSTACK
 	TAILQ_HEAD(, kaiocb) sb_aiojobq; /* (a) pending AIO ops */
 	struct	task sb_aiotask; /* AIO task */
-#else
-	volatile u_long	sb_input_nb;		/* input bytes number */
-	volatile u_long	sb_recvout_nb;		/* recved out bytes number */
-#endif
+//#else
+	void	*sb_fdinfo;		/* struct sockbuf ---> socekt fd */
+//#endif
 };
 
 #ifdef _KERNEL
@@ -164,6 +164,7 @@ struct mbuf *
 void	sbdestroy(struct sockbuf *sb, struct socket *so);
 void	sbdrop(struct sockbuf *sb, int len);
 void	sbdrop_locked(struct sockbuf *sb, int len);
+void    sbcut_front_stream(struct sockbuf *sb, void* m_end);
 struct mbuf *
 	sbcut_locked(struct sockbuf *sb, int len);
 void	sbdroprecord(struct sockbuf *sb);

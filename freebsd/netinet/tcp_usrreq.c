@@ -906,6 +906,7 @@ tcp_usr_rcvd(struct socket *so, int flags)
 	else
 #endif
 	tp->t_fb->tfb_tcp_output(tp);
+	//ff_app_txring_enq((void *) tp);
 
 out:
 	TCPDEBUG2(PRU_RCVD);

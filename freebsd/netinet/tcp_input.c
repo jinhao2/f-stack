@@ -1928,7 +1928,9 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 				sbappendstream_locked(&so->so_rcv, m, 0);
 			}
 			/* NB: sorwakeup_locked() does an implicit unlock. */
-			sorwakeup_locked(so);
+			//sorwakeup_locked(so);
+			ff_sorwakeup_locked(so);
+			
 			if (DELAY_ACK(tp, tlen)) {
 				tp->t_flags |= TF_DELACK;
 			} else {
@@ -3059,7 +3061,7 @@ dodata:							/* XXX */
 			else
 				sbappendstream_locked(&so->so_rcv, m, 0);
 			/* NB: sorwakeup_locked() does an implicit unlock. */
-			sorwakeup_locked(so);
+			ff_sorwakeup_locked(so);
 		} else {
 			/*
 			 * XXX: Due to the header drop above "th" is

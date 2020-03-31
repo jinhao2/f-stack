@@ -68,6 +68,7 @@ static	u_long sb_efficiency = 8;	/* parameter for sbreserve() */
 
 static struct mbuf	*sbcut_internal(struct sockbuf *sb, int len);
 static void	sbflush_internal(struct sockbuf *sb);
+static void ff_rendm_adj(struct sockbuf *sb, struct mbuf *m);
 
 /*
  * Our own version of m_clrprotoflags(), that can preserve M_NOTREADY.
@@ -123,6 +124,50 @@ sbready(struct sockbuf *sb, struct mbuf *m, int count)
 	return (0);
 }
 
+extern void ff_stknb_inc(void* p, int nb);
+extern void ff_soerr_set(void* p, uint16_t err);
+extern int ff_tcp_rwakeup(void*, int);
+
+/********************************************************************
+* check if can wakeup the up layer.
+* return value: 
+* 0 --- should not wakeup up layer.
+* 1 --- error happened, must wakeup.
+* 2 --- recv buffer has enough data, may wakeup.
+*********************************************************************/
+static int ff_soread_filt(struct socket* so)
+{
+	if (so->so_rcv.sb_state & SBS_CANTRCVMORE) {
+		ff_soerr_set(so->so_rcv.sb_fdinfo , so->so_error);
+		return (1);
+	} else if (so->so_error)	/* temporary udp error */	{
+		ff_soerr_set(so->so_rcv.sb_fdinfo , so->so_error);
+		return (1);
+	}
+
+	if (sbavail(&so->so_rcv) >= so->so_rcv.sb_lowat)
+		return 2;
+
+	return 0;
+	/* This hook returning non-zero indicates an event, not error */
+	//return (hhook_run_socket(so, NULL, HHOOK_FILT_SOREAD));
+}
+
+/********************************************************************
+* Stack is lowest layer, most cases are uplayer calling down layer func.
+* Here Stk calling uplay func to send notification msg.
+* 
+*********************************************************************/
+void ff_sorwakeup_locked(struct socket *so){
+	int32_t	type = 0;
+	struct sockbuf *sb = &so->so_rcv;
+	type = ff_soread_filt(so);
+	if (type)
+		ff_tcp_rwakeup( (void*)sb->sb_fdinfo, type);
+	SOCKBUF_UNLOCK( sb );
+	return;
+}
+
 /*
  * Adjust sockbuf state reflecting allocation of m.
  */
@@ -133,6 +178,7 @@ sballoc(struct sockbuf *sb, struct mbuf *m)
 	SOCKBUF_LOCK_ASSERT(sb);
 
 	sb->sb_ccc += m->m_len;
+	ff_stknb_inc( sb->sb_fdinfo, m->m_len);
 
 	if (sb->sb_fnrdy == NULL) {
 		if (m->m_flags & M_NOTREADY)
@@ -160,11 +206,6 @@ sballoc(struct sockbuf *sb, struct mbuf *m)
 void
 sbfree(struct sockbuf *sb, struct mbuf *m)
 {
-
-#if 0	/* XXX: not yet: soclose() call path comes here w/o lock. */
-	SOCKBUF_LOCK_ASSERT(sb);
-#endif
-
 	sb->sb_ccc -= m->m_len;
 
 	if (!(m->m_flags & M_NOTAVAIL))
@@ -239,14 +280,14 @@ socantrcvmore_locked(struct socket *so)
 	SOCKBUF_LOCK_ASSERT(&so->so_rcv);
 
 	so->so_rcv.sb_state |= SBS_CANTRCVMORE;
-	sorwakeup_locked(so);
+	//sorwakeup_locked(so);
+	ff_sorwakeup_locked(so);
 	mtx_assert(SOCKBUF_MTX(&so->so_rcv), MA_NOTOWNED);
 }
 
 void
 socantrcvmore(struct socket *so)
 {
-
 	SOCKBUF_LOCK(&so->so_rcv);
 	socantrcvmore_locked(so);
 	mtx_assert(SOCKBUF_MTX(&so->so_rcv), MA_NOTOWNED);
@@ -311,9 +352,9 @@ void
 sowakeup(struct socket *so, struct sockbuf *sb)
 {
 	int ret;
-
+	int type = 0;
+	
 	SOCKBUF_LOCK_ASSERT(sb);
-
 	selwakeuppri(&sb->sb_sel, PSOCK);
 	if (!SEL_WAITING(&sb->sb_sel))
 		sb->sb_flags &= ~SB_SEL;
@@ -978,6 +1019,7 @@ sbcompress(struct sockbuf *sb, struct mbuf *m, struct mbuf *n)
 			    (unsigned)m->m_len);
 			n->m_len += m->m_len;
 			sb->sb_ccc += m->m_len;
+			ff_stknb_inc( sb->sb_fdinfo, m->m_len);
 			if (sb->sb_fnrdy == NULL)
 				sb->sb_acc += m->m_len;
 			if (m->m_type != MT_DATA && m->m_type != MT_OOBDATA)
@@ -1123,6 +1165,96 @@ sbcut_internal(struct sockbuf *sb, int len)
 
 	return (mfree);
 }
+
+
+/*
+ * free the end mbuf of so_rcv that app has alread copied.
+ * the mbuf should not be cleared to zero and 
+ */
+static void
+ff_rendm_adj(struct sockbuf *sb, struct mbuf *m)
+{
+	sb->sb_ccc -= m->m_len;
+	if (!(m->m_flags & M_NOTAVAIL))
+		sb->sb_acc -= m->m_len;
+
+	if (m == sb->sb_fnrdy) {
+		struct mbuf *n;
+
+		KASSERT(m->m_flags & M_NOTREADY,
+		    ("%s: m %p !M_NOTREADY", __func__, m));
+
+		n = m->m_next;
+		while (n != NULL && !(n->m_flags & M_NOTREADY)) {
+			n->m_flags &= ~M_BLOCKED;
+			sb->sb_acc += n->m_len;
+			n = n->m_next;
+		}
+		sb->sb_fnrdy = n;
+	}
+
+	if (m->m_type != MT_DATA && m->m_type != MT_OOBDATA)
+		sb->sb_ctl -= m->m_len;
+	/*
+	should not free the mbuf.
+	there is no M_EXT mbuf in rcv buff.
+	sb_sndptr must point to m who is  the last mbuf had been recved by app, and is cleared.
+	*/
+	//sb->sb_mbcnt -= MSIZE;
+	//sb->sb_mcnt -= 1;
+	if (m->m_flags & M_EXT) {
+		sb->sb_mbcnt -= m->m_ext.ext_size;
+		sb->sb_ccnt -= 1;
+	}
+
+	//if (sb->sb_sndptr == m) {
+	//	sb->sb_sndptr = NULL;
+	//	sb->sb_sndptroff = 0;
+	//}
+	
+	m->m_data += m->m_len;
+	m->m_len = 0;
+	if (sb->sb_sndptroff != 0)
+	    sb->sb_sndptroff -= m->m_len;
+}
+
+
+/*
+ * Cut data from (the front of) a sockbuf, until the m_end.
+ * Streaming sockbuf had not pkt, only a mbuf chain. 
+ * sb_mb should not go far than m_end,  though whose data had been recved by app.
+ * m_app_end points to the end mbuf that app has read out.
+ */
+void 
+sbcut_front_stream(struct sockbuf *sb, void* m_app_end)
+{
+	struct mbuf *m, *n, *next, *mfree;
+
+	m = sb->sb_mb;
+	KASSERT(m, ("%s: null sb_mb.", __func__));
+	mfree = NULL;
+
+	while ( m != m_app_end && m != NULL ) {
+		sbfree(sb, m);
+		n = m->m_next;
+		m->m_next = mfree;
+		mfree = m;
+		m = n;
+	}
+	KASSERT(m, ("%s: not found end mbuf.", __func__));
+	if( m==m_app_end ){
+		// this maybe called the m_adj() to cut length from mbuf's head when recv copy some length of data not whole mbuf chain.
+	    ff_rendm_adj(sb, m);
+	}
+	//sbfree(sb, m);
+	//m->m_len = 0;			//  last mbuf in tcp sb_rcv should be cleared.
+	
+	sb->sb_mb = m;
+	sb->sb_lastrecord = m;
+	
+	m_freem(mfree);
+}
+
 
 /*
  * Drop data from (the front of) a sockbuf.

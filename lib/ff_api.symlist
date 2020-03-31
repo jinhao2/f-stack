@@ -54,4 +54,16 @@ ff_next_mbuf
 ff_mbuf_mtod
 ff_rte_frm_extcl
 ff_mbuf_set_vlan_info
-ff_tcp_output
+ff_socreate
+ff_tcp_rxupdate
+ff_soconnect
+ff_get_rcvbuf_start
+ff_sorxcopy
+ff_get_rxbuf_fdinfo
+ff_get_txbuf_fdinfo
+ff_soclose
+api_init
+api_socket
+api_bind
+api_connect
+api_recv

@@ -1,8 +1,9 @@
-/******************************************************
+/***************************************************************************************
  * App threads are isolated from f-stack worker, and communicated with f-stackers.
  * This file define rings, events, and rx/tx functions between App and f-stack.
- * Msg communication was implemented in this code.
- * ****************************************************/
+ * No using bsd interal function, and compiled with system default libs.
+ * If bsd's funcs are needed, they should be encapsulated in ff_syscal_wrapper and called indirectly.
+ * ************************************************************************************/
 #include <assert.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -10,7 +11,9 @@
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
-#include <assert.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <fcntl.h>
 
 #include <rte_common.h>
 #include <rte_byteorder.h>
@@ -37,99 +40,150 @@
 #include <rte_tcp.h>
 #include <rte_udp.h>
 #include <rte_eth_bond.h>
+#include <rte_errno.h>
 
-#include "ff_app_rxtx.h"
+#include "ff_dpdk_if.h"
+#include "ff_dpdk_pcap.h"
+#include "ff_dpdk_kni.h"
+#include "ff_config.h"
+#include "ff_veth.h"
+#include "ff_host_interface.h"
+#include "ff_msg.h"
+#include "ff_api.h"
+#include "ff_memory.h"
+#include "ff_msg_rxtx.h"
 
-#define FF_MAX_SOCKET_WORKER    8
+#define WND_MSGPOOL_CACHE_SIZE  256
+#define MSGPOOL_SIZE ((rte_lcore_count()*(512+WND_MSGPOOL_CACHE_SIZE)))
+#define CTL_MSGPOOL_CACHE_SIZE  8
+#define CTLPOOL_SIZE ((rte_lcore_count()*(32+CTL_MSGPOOL_CACHE_SIZE)))
+#define cur_appid 0
+#define FF_SENDUP_CTLMSG(obj,len) UxSktSend(\
+			g_fstk_ctl[this_procid].ff_up_ctl_us.sockfd,\
+			&g_app_ctl[cur_appid].app_up_ctl_us.addr,\
+			(char*)(obj), (len))
+#define FF_SENDUP_WNDMSG(obj) ff_sendup_evt( (obj), g_fstk_ctl[this_procid].ff_up_wnd_r)
+#define FF_SAME_WNDMSG(a,b) ( (a)->event == (b)->event && (a)->sock_fd == (b)->sock_fd )
 
-#define MAX_KEEP 16
-#define CTL_MSGPOOL_CACHE_MAX_SIZE  32
-#define WND_MSGPOOL_CACHE_MAX_SIZE 256
-#define MSGPOOL_SIZE ((rte_lcore_count()*(MAX_KEEP+WND_MSGPOOL_CACHE_MAX_SIZE))-1)
-#define CTLPOOL_SIZE ((rte_lcore_count()*(MAX_KEEP+CTL_MSGPOOL_CACHE_MAX_SIZE))-1)
+const char ff_ux_sockf[] = "./ff_ux_sock";
+const char app_ux_sockf[] = "./app_ux_sock";
 
-#define FF_SENDUP_CTLMSG(obj) ff_sendup_evt(obj, g_fstk_ctl[this_procid].ff_up_ctl_r)
-#define FF_SENDUP_WNMSG(obj) ff_sendup_evt(obj, g_fstk_ctl[this_procid].ff_up_wnd_r)
-
-// each fstack core has one struct ff_fstk_ctl.
-struct ff_fstk_ctl  g_fstk_ctl[8] = {0};            //RTE_MAX_LCORE 
-
-// each app socket worker has one struct ff_app_ctl.
-struct ff_app_ctl   g_app_ctl[FF_MAX_SOCKET_WORKER] ={0};
-
+// each fstack core has one struct ff_fstk_ctl.    //RTE_MAX_LCORE 
+struct ff_fstk_ctl  g_fstk_ctl[8];
+extern struct ff_app_ctl   g_app_ctl[FF_MAX_SOCKET_WORKER];
 extern struct lcore_conf lcore_conf;
-uint16_t this_procid = lcore_conf.proc_id;
-uint16_t this_appid = 0;
+extern __thread uint16_t this_appid;
+extern __thread int32_t ff_errno;
 
-extern struct rte_ring * create_ring(const char *name, unsigned count, int socket_id, unsigned flags)j;
+uint32_t g_fd_total = 4096;
+uint32_t this_procid = 0;           //lcore_conf.proc_id;
 
-/*********************
- * each f-stack core has one up_ring/down_ring
- * each app socket worker has sockop_cache/wndmsg_cache.
- * input param: procid
- * ******************/
-int ff_init_socket_info(int i )
-{
-    char	tmp_name[RTE_RING_NAMESIZE];
-    int     is_primary = (rte_eal_process_type() == RTE_PROC_PRIMARY)? 1: 0;
- 
-        snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "ff_up_wnd_r_", i);
-        g_fstk_ctl[i].ff_up_wnd_r = create_ring(tmp_name, APP_RING_SIZE, lcore_conf.socket_id, 0 );
+extern struct rte_ring * create_ring(const char *name, unsigned count, int socket_id, unsigned flags);
+extern void* ff_socreate(int domain, int type, int protocol);
+extern int ff_soconnect(void* so, const struct linux_sockaddr *l_addr, socklen_t addrlen );
+extern int ff_tcp_rxupdate(void* p, int len, void* p_end);
+extern void* ff_get_rcvbuf_start(void* so);
+extern int ff_sorxcopy(void* so, void* i_ptr, char*buf, int len, int offset);
+extern void** ff_get_rxbuf_fdinfo(void* so);
+extern void** ff_get_txbuf_fdinfo(void* so);
+extern int ff_soclose(void* so);
 
-        snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "ff_up_wnd_rop_", i);
-        g_fstk_ctl[i].ff_up_ctl_r  = create_ring(tmp_name, APP_OP_RING_SIZE, lcore_conf.socket_id, 0 );
+StackList_t g_ff_socket_ctl = {0};
+struct s_fd_sockbuf** g_ff_socket_vector = NULL;
+//volatile uint64_t*  g_ff_in_nb_vec = NULL;              /* tcp push into the sb bytes, added by fstack */
+//volatile uint64_t*  g_ff_out_nb_vec = NULL;		        /* app read out from the sb bytes, added by app*/ 
 
-        snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "ff_down_ring_", i);
-        g_fstk_ctl[i].ff_down_ring  = create_ring(tmp_name, APP_RING_SIZE, lcore_conf.socket_id, 0 );
+int ff_init_fd_ctl(uint32_t maxsockets){
+    int error = 0;
+    int i = 0;
+    g_ff_socket_vector = (struct s_fd_sockbuf**)rte_malloc("socket addr array", maxsockets, sizeof(struct s_fd_sockbuf*));
+    assert( g_ff_socket_vector );
+    
+    stklist_init(&g_ff_socket_ctl, maxsockets);
+    for(i=maxsockets-1; i>0; i--){
+        stklist_push(&g_ff_socket_ctl, i);
+    }
 
-        snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "ff_down_ringop_", i);
-        g_fstk_ctl[i].ff_down_ring  = create_ring(tmp_name, APP_OP_RING_SIZE, lcore_conf.socket_id, 0 );
-
-        snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "sockop_pool_", i);
-        if ( is_primary )
-            g_fstk_ctl[i].ff_ctlmsg_pool = rte_mempool_create(tmp_name, CTLPOOL_SIZE,
-                                                    sizeof(struct s_ff_ctl_msg),
-                                                    CTL_MSGPOOL_CACHE_MAX_SIZE, 0,
-                                                    NULL, NULL,
-                                                    NULL, NULL,
-                                                    SOCKET_ID_ANY, 0);
-        else
-            g_fstk_ctl[i].ff_ctlmsg_pool = rte_mempool_lookup(tmp_name)
-        if ( g_fstk_ctl[i].ff_ctlmsg_pool == NULL){
-            rte_panic("create pool::%s failed!\n", tmp_name);
-            return -1;
-        }
-
-        snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "wndmsg_pool_", i);
-        if ( is_primary )
-            g_fstk_ctl[i].ff_wndmsg_pool = rte_mempool_create(tmp_name, MSGPOOL_SIZE,
-                                                    sizeof(struct s_ff_wnd_msg),
-                                                    WND_MSGPOOL_CACHE_MAX_SIZE, 0,
-                                                    NULL, NULL,
-                                                    NULL, NULL,
-                                                    SOCKET_ID_ANY, 0);
-        else
-            g_fstk_ctl[i].ff_wndmsg_pool = rte_mempool_lookup(tmp_name);
-        if ( g_fstk_ctl[i].ff_wndmsg_pool == NULL){
-            rte_panic("create pool::%s failed!\n", tmp_name);
-            return -1;
-        }
+/*******
+    g_ff_in_nb_vec = ( uint64_t *) rte_malloc("socket in_nb vec", maxsockets, sizeof(uint64_t));
+    assert( g_ff_in_nb_vec );
+    g_ff_out_nb_vec = ( uint64_t *) rte_malloc("socket out_nb vec", maxsockets, sizeof(uint64_t));
+    assert(g_ff_out_nb_vec);
+*******/
 
     return 0;
 }
 
-/***************************************
- * create app caches for each socket worker.
- * ************************************/
+/*****************************************************************************************************************
+ * each f-stack core has one up_ring/down_ring
+ * each app socket worker has sockop_cache/wndmsg_cache.
+ * input param: procid
+ * **************************************************************************************************************/
+int ff_init_socket_info(int i){
+    char	tmp_name[RTE_RING_NAMESIZE];
+    int     is_primary = (rte_eal_process_type() == RTE_PROC_PRIMARY)? 1: 0;
+ 
+    snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "ff_up_wnd_r_", i);
+    g_fstk_ctl[i].ff_up_wnd_r = create_ring(tmp_name, APP_RING_SIZE, lcore_conf.socket_id, 0 );
+
+    //snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "ff_up_ctl_r_", i);
+    //g_fstk_ctl[i].ff_up_ctl_r  = create_ring(tmp_name, APP_OP_RING_SIZE, lcore_conf.socket_id, 0 );
+    InitDgramSock(&g_fstk_ctl[i].ff_up_ctl_us, ff_ux_sockf, 1, 0);
+
+    snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "ff_down_wnd_r_", i);
+    g_fstk_ctl[i].ff_down_wnd_r  = create_ring(tmp_name, APP_RING_SIZE, lcore_conf.socket_id, 0 );
+
+    snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "ff_down_ctl_r_", i);
+    g_fstk_ctl[i].ff_down_ctl_r  = create_ring(tmp_name, APP_OP_RING_SIZE, lcore_conf.socket_id, 0 );
+
+    snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "sockop_pool_", i);
+    if ( is_primary )
+        g_fstk_ctl[i].ff_ctlmsg_pool = rte_mempool_create(tmp_name, CTLPOOL_SIZE,
+                                                    sizeof(struct s_ff_ctl_msg),
+                                                    CTL_MSGPOOL_CACHE_SIZE, 0,
+                                                    NULL, NULL,
+                                                    NULL, NULL,
+                                                    SOCKET_ID_ANY, 0);
+    else
+        g_fstk_ctl[i].ff_ctlmsg_pool = rte_mempool_lookup(tmp_name);
+    
+    if ( g_fstk_ctl[i].ff_ctlmsg_pool == NULL){
+        rte_panic("create pool::%s failed, %s!\n", tmp_name, rte_strerror(rte_errno));
+        return -1;
+    }
+
+    snprintf(tmp_name, RTE_RING_NAMESIZE, "%s%u", "wndmsg_pool_", i);
+    if ( is_primary )
+        g_fstk_ctl[i].ff_wndmsg_pool = rte_mempool_create(tmp_name, MSGPOOL_SIZE,
+                                                    sizeof(struct s_ff_wnd_msg),
+                                                    WND_MSGPOOL_CACHE_SIZE, 0,
+                                                    NULL, NULL,
+                                                    NULL, NULL,
+                                                    SOCKET_ID_ANY, 0);
+    else
+        g_fstk_ctl[i].ff_wndmsg_pool = rte_mempool_lookup(tmp_name);
+    if ( g_fstk_ctl[i].ff_wndmsg_pool == NULL){
+        rte_panic("create pool::%s failed, %s!\n", tmp_name, rte_strerror(rte_errno));
+        return -1;
+    }
+
+	ff_init_fd_ctl(g_fd_total);
+    return 0;
+}
+
+/**************************************************************************
+ * create app caches for each socket worker
+ * called by app.
+ * ***********************************************************************/
 int ff_creat_app_info( uint16_t appid )
 {
     struct epoll_event ev = {0};
-
+    
     //RTE_ASSERT( appid < FF_MAX_SOCKET_WORKER );
-    g_app_ctl[appid].app_ctlmsg_cache = rte_mempool_cache_create(CTL_MSGPOOL_CACHE_MAX_SIZE, SOCKET_ID_ANY);
-    g_app_ctl[appid].app_wndmsg_cache = rte_mempool_cache_create(WND_MSGPOOL_CACHE_MAX_SIZE, SOCKET_ID_ANY);
+    g_app_ctl[appid].app_ctlmsg_cache = rte_mempool_cache_create(CTL_MSGPOOL_CACHE_SIZE, SOCKET_ID_ANY);
+    g_app_ctl[appid].app_wndmsg_cache = rte_mempool_cache_create(WND_MSGPOOL_CACHE_SIZE, SOCKET_ID_ANY);
 
-    eventfd(g_app_ctl[appid].evt_fd, EFD_CLOEXEC|EFD_NONBLOCK);
+    g_app_ctl[appid].evt_fd = eventfd(0, EFD_CLOEXEC|EFD_NONBLOCK);
     if ( g_app_ctl[appid].evt_fd <= 0 )
     {
         rte_panic("eventfd evt_fd failed errno %d!\n", errno);
@@ -147,6 +201,8 @@ int ff_creat_app_info( uint16_t appid )
         return -1;
     }
 
+	InitDgramSock(&g_app_ctl[appid].app_up_ctl_us, app_ux_sockf, 1, 0);
+/************
     eventfd(g_app_ctl[appid].sock_evtfd, EFD_CLOEXEC|EFD_NONBLOCK);
     if ( g_app_ctl[appid].sock_evtfd <= 0 ){
         rte_panic("eventfd sock_evtfd failed errno %d!\n", errno);
@@ -163,32 +219,23 @@ int ff_creat_app_info( uint16_t appid )
         rte_panic("epoll_ctl failed errno %d!\n", errno);
         return -1;
     }
+*************/
     return 0;
 }
 
-/***************************************
- * fstack input new data into sockbuf, return the new input data.
- * return code: 
- *  0: no need sending up wnd msg.
- *  >0:need to send up wnd msg.
-****************************************/
-static inline int ff_sockbuf_input( struct sockbuff* sb, uint32_t nb ){
-    sb->sb_input_nb += nb;
-    if ( unlikely( sb->sb_input_nb == sb->sb_recvout_nb+nb ) ){
-        return nb;           // should trigger new wnd update msg.
-    }
+/********************************************************************************
+ * get new app worker id, which is identical for each worker thread.
+ * 
+********************************************************************************/
+int ff_get_newid(){
     return 0;
-}
-
-static inline void ff_sockbuf_recvout( struct sockbuff* sb, uint32_t nb ){
-    sb->sb_recvout_nb += nb;
 }
 
 /***************************************
  * get msg for communicate between fstack and socket worker.
  * In this function, up msg was allocated in fstack; down msg was allocated in app.
 ****************************************/
-static inline void* ff_get_sock_msg(int16_t type, uint16_t procid ){
+void* ff_get_sock_msg(int16_t type, uint16_t procid ){
     struct ff_fstk_ctl* p_fstk = &g_fstk_ctl[procid];
     struct ff_app_ctl*  p_app = &g_app_ctl[procid];
     void* ptr = NULL;
@@ -199,12 +246,19 @@ static inline void* ff_get_sock_msg(int16_t type, uint16_t procid ){
         break;
     case UP_WND_MSG:
         rte_mempool_get(p_fstk->ff_wndmsg_pool, &ptr);
+        if ( unlikely( NULL==ptr ) ){
+            RTE_LOG(INFO, USER1, "ff_get_sock_msg get failed, wndmsg mempool freecout %d.", 
+                    rte_mempool_avail_count(p_fstk->ff_wndmsg_pool) );
+        }
+        break;
     case DOWN_CTL_MSG:
         rte_mempool_generic_get(p_fstk->ff_ctlmsg_pool, &ptr, 1, p_app->app_ctlmsg_cache);
+        break;
     case DOWN_WND_MSG:
         rte_mempool_generic_get(p_fstk->ff_wndmsg_pool, &ptr, 1, p_app->app_wndmsg_cache);
+        break;
     default:
-        void* ptr = NULL;
+        ptr = NULL;
         break;
     }
     return ptr;
@@ -214,20 +268,23 @@ static inline void* ff_get_sock_msg(int16_t type, uint16_t procid ){
  * free msg for communicate between fstack and socket worker.
  * In this function, up msg was freed in app; down msg was freed in fstack.
 ****************************************/
-static inline int ff_free_sock_msg( int16_t type, uint16_t procid, void** obj, uint32_t num){
+int ff_free_sock_msg( int16_t type, uint16_t procid, void** obj, uint32_t num){
     struct ff_fstk_ctl* p_fstk = &g_fstk_ctl[procid];
     struct ff_app_ctl*  p_app = &g_app_ctl[procid];
-
+    if ( !num ) return -1;
     switch ( type ){
     case UP_CTL_MSG:
         rte_mempool_generic_put(p_fstk->ff_ctlmsg_pool, obj, num, p_app->app_ctlmsg_cache);
         break;
     case UP_WND_MSG:
         rte_mempool_generic_put(p_fstk->ff_wndmsg_pool, obj, num, p_app->app_wndmsg_cache);
+        break;
     case DOWN_CTL_MSG:
         rte_mempool_put_bulk(p_fstk->ff_ctlmsg_pool, obj, num);
+        break;
     case DOWN_WND_MSG:
         rte_mempool_put_bulk(p_fstk->ff_wndmsg_pool, obj, num);
+        break;
     default:
         return -1;
         break;
@@ -235,40 +292,173 @@ static inline int ff_free_sock_msg( int16_t type, uint16_t procid, void** obj, u
     return 0;
 }
 
-#define FF_SENDUP_SIGNAL_THRESHOLD  8
-
-StackList_t g_ff_socket_ctl = {0};
-struct socket** g_ff_socket_vector = NULL;
-volatile uint64_t*  g_ff_in_nb_vec = NULL;              /* tcp push into the sb bytes, added by fstack */
-volatile uint64_t*  g_ff_out_nb_vec = NULL;		        /* app read out from the sb bytes, added by app*/ 
-
-int ff_init_fd_ctl(uint32_t maxsockets){
-    int error = 0;
-
-    g_ff_socket_vector = (struct socket**)rte_malloc("socket addr array", maxsockets, sizeof(void*));
-    assert( g_ff_socket_vector );
-    
-    stklist_init(&g_ff_socket_ctl, maxsockets);
-    for(int i=maxsockets-1; i>0; i--){
-        stklist_push(&g_ff_socket_ctl, i);
-    }
-
-    g_ff_in_nb_vec = ( uint64_t ) rte_malloc("socket in_nb vec", maxsockets, sizeof(uint64_t));
-    assert( g_ff_in_nb_vec );
-    g_ff_out_nb_vec = ( uint64_t ) rte_malloc("socket out_nb vec", maxsockets, sizeof(uint64_t));
-    assert(g_ff_out_nb_vec);
-
-    return 0;
+static inline void ff_vec_setfd(int sockfd ){
+    g_ff_socket_vector[sockfd]->sock_fd = sockfd;
+}
+static inline void ff_vec_setid(int sockfd, int appid ){
+    g_ff_socket_vector[sockfd]->app_id = appid;
+}
+/**************************************************************************
+ * set fdsock->so  =  i_so.
+ * called as soon as socreate().
+ * ************************************************************************/
+static inline void ff_vec_setso(int sockfd, void* i_so ){
+    g_ff_socket_vector[sockfd]->so = i_so;
 }
 
-// curthread is the fstack thread.
+void* ff_get_fdsock( int s ){
+    return (void*)g_ff_socket_vector[s];
+}
 /**************************************************************************
  * fstack get struct socket from g_ff_socket_vector indexed by fd.
  * 
- * In BSD socket = (struct socket *)curthread->td_proc->p_fd->fd_files->fdt_ofiles[fd].fde_file->f_data;
+ * In 
  * ************************************************************************/
-static inline struct socket* ff_get_sock_obj( int s ){
-    return g_ff_socket_vector[s];
+void* ff_get_sock_obj( int s ){
+    return (void*)g_ff_socket_vector[s]->so;
+}
+
+int ff_get_sockst(int s){
+	return g_ff_socket_vector[s]->so_stat;
+}
+int ff_set_sostat(int s, int st){
+	g_ff_socket_vector[s]->so_stat |= st;
+	return g_ff_socket_vector[s]->so_stat;
+}
+#define FF_EPOLL_IN		0x01
+#define FF_SO_USING		0x02
+#define FF_EPOLL_OUT	0x04
+#define FF_SO_ESTAB		0x08
+#define FF_SO_FIN    	0x10
+#define FF_SO_RESET		0x20
+
+static void ff_clear_epollin(s){
+	g_ff_socket_vector[s]->so_stat &= (~FF_EPOLL_IN);
+}
+void ff_clear_epollout(s){
+	g_ff_socket_vector[s]->so_stat &= (~FF_EPOLL_OUT);
+}
+int ff_get_err(int fd){
+	return (int)g_ff_socket_vector[fd]->so_error;
+}
+
+static inline int32_t ff_can_rx(int s){
+
+	return g_ff_socket_vector[s]->app_copied_nb < g_ff_socket_vector[s]->stk_input_nb;
+	
+}
+
+/**************************************************************************
+ * fstack get struct socket from g_ff_socket_vector indexed by fd.
+ * 
+ * In 
+ * ************************************************************************/
+
+/**************************************************************************
+ * used by stack to increase the stk_input_nb.
+ * In rx buff, tcp_input incread the stk_input_nb.
+ * In tx buff, tcp_output increase the stk_input_nb.
+ * ************************************************************************/
+void ff_stknb_inc(void* p, int nb){
+    struct s_fd_sockbuf* p_fdsock = p;
+    p_fdsock->stk_input_nb += nb;
+}
+/**************************************************************************
+ * used by stack to set socket error.
+ * 
+ * 
+ * ************************************************************************/
+void ff_soerr_set(void* p, uint16_t err){
+    struct s_fd_sockbuf* p_fdsock = p;
+    p_fdsock->so_error = err;
+}
+
+void ff_set_offset(void* p, uint16_t nb){
+    struct s_fd_sockbuf* p_fdsock = p;
+    p_fdsock->m_offset = nb;
+}
+
+/**************************************************************************
+ * stack set the sb_app_recv to the start position of socket buffer.
+ * In rx, tcp_input set sb_app_recv to sb_mb when sb_app_recv==NULL.
+ * p ---> s_fd_sockbuf
+ * pos----> struct mbuf* in sockbuf->sb_mb link.
+ * ************************************************************************/
+void* ff_get_rcvptr( void* p ){
+	struct s_fd_sockbuf* p_fdsock = p;
+	return (void*)p_fdsock->sb_app_recv;
+}
+void ff_set_rcvptr( void* p, void* m ){
+	struct s_fd_sockbuf* p_fdsock = p;
+	p_fdsock->sb_app_recv = (uint64_t)m;
+}
+
+void ff_epnb_inc(int s){
+    struct s_fd_sockbuf* p_fdsock = g_ff_socket_vector[s];
+    p_fdsock->epoll_nb++;
+}
+
+/************************************************
+ * in parameter is struct s_fd_sockbuf *
+ * rx mbuf is_empty means all data has been copy out by app.
+ * tx_mbuf is_empty means all data has been send out by fstack.
+ * *********************************************/
+int ifsock_empty(void* p){
+    struct s_fd_sockbuf* p_sockinfo = p;
+	return p_sockinfo->app_copied_nb == p_sockinfo->stk_input_nb? 1 : 0;
+}
+
+/************************************************
+ * app copy data from some complete mbuf in rxbuffer.
+ * sb_app_recv is the next mbuf that app will copied from.
+ * refer to soreceive_stream
+ * *********************************************/
+int ff_read_rx( int fd, void *buf, size_t len ){
+    int32_t o_len = 0, firstmsg=0;
+    struct mbuf    *mb = NULL;
+    struct s_fd_sockbuf* ptr = NULL;
+
+    if ( fd >= g_fd_total ){
+    	ff_errno = ff_EBADF;
+        return -1;
+    }
+    if ( !ff_can_rx(fd) ){
+    	ff_errno = ff_EAGAIN;
+    	return 0;
+    }
+    ptr = g_ff_socket_vector[fd];
+    if ( unlikely(ptr->sb_app_recv == 0) ){
+        /* set sb_app_recv to sb_mb */
+        ptr->sb_app_recv = (u_int64_t)ff_get_rcvbuf_start( ptr->so );
+        ptr->m_offset = 0;
+    }
+    if ( unlikely(ptr->sb_app_recv == 0) ){
+        /*  the sock buf is empty.  */
+        ff_clear_epollin(fd);
+        ff_errno = ff_EAGAIN;
+        return -1;
+    }
+    //firstmsg = ( g_ff_socket_vector[fd]->app_copied_nb == 0 )? 1 : 0;
+    o_len = ff_sorxcopy( ptr->so, (void*)ptr->sb_app_recv, buf, len, ptr->m_offset);
+    if ( o_len < 0 ){           // error
+    	ff_clear_epollin(fd);
+        return -1;
+    }
+    else if ( o_len ==0 )       // fin
+    {
+        ff_clear_epollin(fd);
+        return 0;
+    }
+    
+    ptr->app_copied_nb += o_len;
+    if ( ptr->app_copied_nb == ptr->stk_input_nb ){
+        // recv buf is empty.
+        ff_clear_epollin(fd);
+    }
+    else if ( ptr->app_copied_nb < ptr->stk_input_nb  ){
+    	CList_Push(&g_app_ctl[this_appid].fd_list, fd);
+    }
+    return o_len;
 }
 
 /**************************************************************************
@@ -280,55 +470,68 @@ static inline int ff_sendup_evt(void* msg, struct rte_ring* up_ring){
     //uint32_t pre_num, cur_num;
     //pre_num = rte_ring_count(up_ring);
     int ret = rte_ring_sp_enqueue(up_ring, (void*) msg);
-    if ( unlikely( res!=1 ) ){
-        ff_free_sock_msg(UP_CTL_MSG, this_procid, *msg, 1);
+    if ( unlikely( ret!=0 ) ){
+        ff_free_sock_msg(UP_CTL_MSG, this_procid, (void**)&msg, 1);
         return -1;
     }
     if ( likely( 1 == rte_ring_count(up_ring) ) ){
-        eventfd_write(g_app_ctl[appid].evt_fd, 1);
+        eventfd_write(g_app_ctl[this_appid].evt_fd, 1);
     }
-    return ret;
+    return 0;
 }
 
-/*************************
+/******************************************************************************
  * fstack recv SOCKET_EV, create new socket.
  * get socket from global vector and allocate new struct socket.
- * **********************/
-int ff_new_socket(int domain, int type, int protocol){
-    uint32_t fd = 0;
-    struct socket *so;
+ * ***************************************************************************/
+int ff_new_socket(int domain, int type, int protocol, int appid){
+    int32_t fd = 0;
+    void* so = NULL;
 
-    fd = stklist_pop(&g_ff_socket_ctl);
+    fd = (int32_t)stklist_pop(&g_ff_socket_ctl);
     if ( unlikely( g_ff_socket_vector[fd]==NULL) ){
-        int error = socreate(domain, &so, type, protocol, NULL, curthread);
-        if ( unlikely(error!=0) ){
+        so = ff_socreate(domain, type, protocol );
+        if ( unlikely(so == NULL) ){
             stklist_push(&g_ff_socket_ctl, fd);
             return -1;
         }
-    }
-    g_ff_socket_vector[fd] = so;
+        g_ff_socket_vector[fd] = rte_zmalloc("socketinfo", sizeof(struct s_fd_sockbuf), RTE_CACHE_LINE_SIZE);
+        assert( NULL!= g_ff_socket_vector[fd] );
+
+        ff_vec_setfd( fd );
+        ff_vec_setid( fd, appid );
+        ff_vec_setso( fd, so );
+        *(ff_get_rxbuf_fdinfo(so)) = g_ff_socket_vector[fd];
+        *(ff_get_txbuf_fdinfo(so)) = g_ff_socket_vector[fd];        
+    }    
+
     return fd;
+}
+
+int ff_chk_sockfd(int fd){
+    return g_ff_socket_vector[fd]==NULL? 0 : ( g_ff_socket_vector[fd]->sock_fd <= 0? 0 : 1 );
 }
 
 /*****************************************************
  * fstack recv socket open event, get new fd, 
- * update the msg, sent it back. no need getting new s_ff_ctl_msg.
+ * update the msg, sent it back. no need allocating new s_ff_ctl_msg.
  * **************************************************/
-static int ff_sock_ev_proc(struct s_ff_ctl_msg* sock_req){
+static int ff_sock_proc(struct s_ff_ctl_msg* sock_req){
     int fd = 0;
     struct s_ff_ctl_msg* rsp = NULL;
-    fd = ff_new_socket(sock_req->req.sock_req.domain, sock_req->req.sock_req.type, sock_req->req.sock_req.protocol);
+    fd = ff_new_socket(sock_req->req.sock_req.domain, sock_req->req.sock_req.type, 
+                        sock_req->req.sock_req.protocol, sock_req->app_id);
     if ( unlikely(fd <= 0) ){
         return -1;
     }
+
     rsp = (struct s_ff_ctl_msg*)sock_req; // reuse sock request msg.
-    rsp->app_id = this_appid;
-    rsp->event = SOCKET_EV;
     rsp->sock_fd = rsp->rsp.op_rsp.result = fd;
-    if ( unlikely(ff_sendup_evt((void*) rsp， g_fstk_ctl[this_procid].ff_up_ctl_r) != 1)){
-        RTE_LOG(INFO, sockmsg, "ff_sock_ev_proc enqueue failed." );        
+    if (unlikely(FF_SENDUP_CTLMSG((char*)&rsp, sizeof(rsp)) != sizeof(rsp)) ){
+        RTE_LOG(INFO, USER1, "ff_sock_ev_proc enqueue failed." );
         return -1;
     }
+    ff_set_sostat(fd, FF_SO_USING);             //  this socket is using.
 
     return 0;
 }
@@ -338,125 +541,174 @@ static int ff_sock_ev_proc(struct s_ff_ctl_msg* sock_req){
  * rsp message will be sent after connectting completed.
  * 
  * **************************************************/
-static int ff_connect_ev_proc(struct s_ff_ctl_msg* req){
-
-    struct sockaddr_storage bsdaddr;
-    struct socket* so = NULL;
-
-    linux2freebsd_sockaddr(req->req.conn_req.laddr , req->req.conn_req.len, (struct sockaddr *)&bsdaddr);
-    so = ff_get_sock_obj( con_req->sock_fd );
-    if (so->so_state & SS_ISCONNECTING) {
-		return (EALREADY);
+static int ff_conn_proc(struct s_ff_ctl_msg* req){
+    if (ff_get_sock_obj( req->sock_fd ) == NULL){
+        RTE_LOG(INFO, USER1, "ff_conn_proc invalid fd %d.", req->sock_fd );
+        return -1;
     }
-    soconnect(so, bsdaddr, curthread);
-    so->so_state &= ~SS_ISCONNECTING;
-    ff_free_sock_msg(DOWN_CTL_MSG, this_procid, &req, 1);
+    ff_soconnect(ff_get_sock_obj(req->sock_fd), (void*)&req->req.conn_req.p_addr, req->req.conn_req.len );
+    ff_free_sock_msg(DOWN_CTL_MSG, this_procid, (void**)&req, 1);
     return 0;
 }
 
 /*****************************************************
  * fstack send connect rsp to app after connect op completed.
- * should be called by tcp_input routing when connect OK, connect failed, timeout.
+ * should be called by tcp_input routing when connect OK, connect failed, or timeout.
+ * 
  * **************************************************/
-int ff_connect_ok(int fd, int res){
+int ff_conn_ok_sync(int fd, int res){
     struct s_ff_ctl_msg* rsp = ff_get_sock_msg( UP_CTL_MSG, this_procid);
 
     rsp->app_id = this_procid;
     rsp->event = CONNECT_EV;
     rsp->sock_fd = fd;
-    rsp->rsp.op_rsp.result = res;
-    if ( unlikely( FF_SENDUP_CTLMSG(rsp) != 1)){
-        RTE_LOG(INFO, sockmsg, "ff_connect_ok enqueue failed." );
+    rsp->rsp.op_rsp.result = 0;
+    if ( unlikely( FF_SENDUP_CTLMSG(rsp, sizeof(struct s_ff_ctl_msg)) != 1)){
+        ff_free_sock_msg(UP_CTL_MSG, this_procid, (void**)&rsp, 1);
+        RTE_LOG(INFO, USER1, "ff_connect_ok enqueue failed." );
         return -1;
     }
 
     return 0;
 }
 
-/************************************************************
- * fstack update all the rx buffer.
- * not support  PR_ADDR/MSG_PEEK/MT_CONTROL/MSG_SOCALLBCK/MSG_WAITALL  
- * mp0 == NULL, 
- * support MT_OOBDATA 
- * refer to soreceive_stream().
- * ********************************************************/
-int ff_rxwnd_update( int sock_fd, uint32_t mod_nb ){
-    int error = 0;
-    int len = mod_nb;
-    struct socket* so = ff_get_sock_obj(sock_fd);
-    /*
-	 * Remove the delivered data from the socket buffer unless we
-	 * were only peeking.
-	 */
-	if (len > 0)
-		sbdrop_locked(sb, len);
+int ff_conn_ok_async(int fd, int res){
+    struct s_ff_wnd_msg* rsp = ff_get_sock_msg( UP_WND_MSG, this_procid);
 
-	/* Notify protocol that we drained some data. */
+    rsp->app_id = this_procid;
+    rsp->event = FF_RX_WND_EV|FF_TX_WND_EV;
+    rsp->sock_fd = fd;
+    rsp->mod_nb = 0;
+    if ( unlikely( FF_SENDUP_WNDMSG(rsp) != 1)){
+        ff_free_sock_msg(UP_WND_MSG, this_procid, (void**)&rsp, 1);
+        RTE_LOG(INFO, USER1, "ff_connect_ok enqueue failed." );
+        return -1;
+    }
 
-	VNET_SO_ASSERT(so);
-	(*so->so_proto->pr_usrreqs->pru_rcvd)(so, flags);
+    return 0;
+}
 
-	//SOCKBUF_LOCK_ASSERT(sb);
-	SBLASTRECORDCHK(sb);
-	SBLASTMBUFCHK(sb);
-	//SOCKBUF_UNLOCK(sb);
-	//sbunlock(sb);
+static inline int ff_close_proc(struct s_ff_ctl_msg* req){
+    void* so = NULL;
+    
+    assert(NULL!=req);
+    so = ff_get_sock_obj( req->sock_fd );
+    if ( so  == NULL){
+        RTE_LOG(INFO, USER1, "ff_close_proc invalid fd %d.", req->sock_fd );
+        return -1;
+    }
+    ff_soclose(so);
+    ff_free_sock_msg(DOWN_CTL_MSG, this_procid, (void**)&req, 1);
 	return 0;
 }
 
 /**************************************************
- * fstack process one req from app.
+ * fstack dequeue req from down ctl ring, and proc the req.
  * called by fstack's main circle.
  * ***********************************************/
-int ff_proc_req_msg(struct s_ff_ctl_msg* req){
+int ff_proc_ctlreq_msg(struct s_ff_ctl_msg* req){
     switch(req->event){
         case SOCKET_EV:
-            ff_sock_ev_proc( (struct s_ff_ctl_msg*) req);
+            ff_sock_proc( (struct s_ff_ctl_msg*) req);
             break;
         case CONNECT_EV:
-            ff_connect_ev_proc( (struct s_ff_ctl_msg*) req);
+            ff_conn_proc( (struct s_ff_ctl_msg*) req);
             break;
-        case BIND_EV:
-            
-            break;
+        case CLOSE_EV:
+        	ff_close_proc((struct s_ff_ctl_msg*) req);
+        	break;
+        //case BIND_EV:
+            //break;
         default:
             break;
-    }
+    };
+    return 0;
 }
-#define MAX_DOWN_RING_BURST 64
-#define MAX_DOWN_RING_MSG   1024
+
+/************************************************************
+ * fstack update all the rx buffer.
+ * not support  PR_ADDR/MSG_PEEK/MT_CONTROL/MSG_SOCALLBCK/MSG_WAITALL, recv with flags = 0.
+ * 
+ * ********************************************************/
+int ff_rxwnd_update( int sock_fd, int len ){
+    int error = 0;
+    void* so;
+    so = ff_get_sock_obj(sock_fd);
+    if ( so==NULL ){
+        return -1;
+    }
+    
+    ff_tcp_rxupdate( so, len, (void*)g_ff_socket_vector[sock_fd]->sb_app_recv);
+	return 0;
+}
+/***************************************
+* fstack update txbuffer after app send something, using wndmsg carry mbuf is secure.
+* refer to sosend_generic -- copy user data into mbuf
+* refer to tcp_usr_send -- sbappendstream_locked(&so->so_snd, m, flags);
+****************************************/
+int ff_txwnd_update( int sock_fd, uint32_t mod_nb ){
+    int error = 0;
+    int len = mod_nb;
+    void* so = ff_get_sock_obj(sock_fd);
+
+	//sbappendstream_locked(&so->so_snd, m, flags);
+	return 0;
+}
+
+static inline int ff_wndmsg_proc(int fd, uint16_t ev, int mod){
+    return ( ev==RX_WND_EV? ff_rxwnd_update(fd, mod ):ff_txwnd_update(fd,mod));
+}
+
 /*********************************************************
  * Process the down wnd msg from app to f-stack.
- * Try to update same socket once when continuous same socket's wnd msg.
+ * Try to update same socket once when continuous same socket's wnd msg. Is it really needed?
+ * ----- Maybe should burst one batch, divied all msg, process all socket at the end, each socket was processed only once.
  * ******************************************************/
 void ff_proc_wnd_ring(){
 	struct s_ff_wnd_msg* ele_burst[MAX_DOWN_RING_BURST];
 	int i = 0, nb_rx = 0, count = 0;
-    uint32_t wnd_mod = 0;
-    struct s_ff_wnd_msg* pre_msg = NULL;
+    int32_t wnd_mod = 0;
+    struct s_ff_wnd_msg* p_msg = NULL;
 
     if ( unlikely( rte_ring_empty(g_fstk_ctl[this_procid].ff_down_wnd_r) ) ){
         return ;
     }
 
-	nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_wnd_r, ele_burst, MAX_DOWN_RING_BURST, NULL);
+	nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_wnd_r, 
+	            (void**)ele_burst, MAX_DOWN_RING_BURST, NULL);
+/*****
     while ( nb_rx ){
         for ( i=0; i<nb_rx; i++){
-            if( wnd_mod == 0 || !pre_msg || pre_msg->sock_fd == ele_burst[i]->sock_fd ){
+            if( wnd_mod == 0 || !pre_msg || FF_SAME_WNDMSG(pre_msg, ele_burst[i]) ){
                 wnd_mod += ele_burst[i]->mod_nb;
                 pre_msg = ele_burst[i];
+                continue;
             }
-            else if ( pre_msg->sock_fd != ele_burst[i]->sock_fd ){
+            if ( !FF_SAME_WNDMSG(pre_msg, ele_burst[i]) ){
                 // update continous same socket wnd.
-                ff_rxwnd_update( pre_msg->sock_fd, wnd_mod );
+                ff_wndmsg_proc( pre_msg->sock_fd, pre_msg->event, wnd_mod );
                 wnd_mod = 0;
                 pre_msg = NULL;
             }
         }
+        //  runs out quota once.
         count += nb_rx;
-        if ( unlikely(count >= MAX_DOWN_RING_MSG ) )
+        if ( unlikely(count >= MAX_DOWN_RING_MSG ) )					
             break;
-        nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_wnd_r, ele_burst, MAX_PKT_BURST, NULL);
+        nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_wnd_r, (void**)ele_burst, MAX_PKT_BURST, NULL);
+    }
+******/
+    while ( nb_rx ){
+    	for ( i=0;i<nb_rx;i++ ){
+    	    p_msg = ele_burst[i];
+            ff_wndmsg_proc( p_msg->sock_fd, p_msg->event, p_msg->mod_nb);
+        }
+        ff_free_sock_msg(DOWN_WND_MSG, this_procid, (void**)ele_burst, nb_rx);
+        count += nb_rx;
+        if ( unlikely(count >= MAX_DOWN_RING_MSG ) )					
+            break;
+        nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_wnd_r, 
+                    (void**)ele_burst, MAX_PKT_BURST, NULL);
     }
 }
 
@@ -471,291 +723,330 @@ void ff_proc_ctl_ring(){
     if ( unlikely( rte_ring_empty(g_fstk_ctl[this_procid].ff_down_ctl_r) ) ){
         return ;
     }
-
-	nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_ctl_r, ele_burst, MAX_DOWN_RING_BURST, NULL);
+	nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_ctl_r, (void**)ele_burst, MAX_DOWN_RING_BURST, NULL);
     while ( nb_rx ){
         for ( i=0; i<nb_rx; i++){
-            ff_proc_req_msg( ele_burst[i] );
+            ff_proc_ctlreq_msg( ele_burst[i] );        // need to free the msg in .
         }
-        ff_free_sock_msg(g_fstk_ctl[this_procid].ff_wndmsg_pool, ele_burst, nb_rx);
+        //ff_free_sock_msg(DOWN_WND_MSG, this_procid, (void**)ele_burst, nb_rx);
         count += nb_rx;
         if ( unlikely(count >= MAX_DOWN_RING_MSG ) )
-            break;
-        
-        nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_wnd_r, ele_burst, MAX_PKT_BURST, NULL);
+            break;        
+        nb_rx = rte_ring_dequeue_burst(g_fstk_ctl[this_procid].ff_down_wnd_r, (void**)ele_burst, MAX_PKT_BURST, NULL);
     }
 }
 
-/*************************************************
- * fstack wakeup the waiting queue after rx buffer is large enough
- * Called by tcp_input routing, how only if rx buffer from 0 to nonezero.
- * len: the new added length.
- * **********************************************/
-int ff_tcp_input_ok(struct sockbuf* sb, int len){
+enum {
+	WND_UPDATE_MSG = 0,
+	CONNOK_MSG,
+	FIN_MSG,
+	RST_MSG,
+	ACCEPT_MSG
+};
+
+/******************************************************************************
+ * Check whether can send rx notification. 
+ * return 0: should not wakeup.
+ * return 1: must wakeup.
+ * ***************************************************************************/
+int ff_soread_chk(){
+    return 0;
+}
+
+/******************************************************************************
+ * fstack wakeup the waiting queue after rx buffer has enough bytes.
+ * Called by tcp_input routing, if need to wakeup waiting app.
+ * Type : wnd_msg_notify  fin_notify  rst_notify
+ * ***************************************************************************/
+int ff_tcp_rwakeup(void* p, int type){
     int16_t mod;
-    int fd, num;
-    struct s_ff_wnd_msg* p_msg;
+    int num, len;
+    struct s_fd_sockbuf* sockinfo = p;
+    struct s_ff_wnd_msg* p_msg = NULL;
 
-    mod = ff_sockbuf_input(sb, len);
-    if( !mod )
-        return 0;
-    p_msg = ff_get_sock_msg( UP_WND_MSG, this_procid );
-    assert(p_msg);
+    if ( type == 2 ){
+    	// no socket error happened.
+    	if (sockinfo->stk_wakeup_nb > sockinfo->epoll_nb
+    		//|| sockinfo->stk_input_nb == sockinfo->app_copied_nb 
+    		|| sockinfo->so_stat&FF_EPOLL_IN
+    		){
+        	/* there is at least 1 wnd_msg in the up_wnd_ring. or socket has been epollin. */
+        	return 0;
+        }
+        len = sockinfo->stk_input_nb - sockinfo->app_copied_nb;
+        assert( len>0 );
+    }
 
-    fd = sb->fd_wait;                      //  waitfd replace "struct	selinfo sb_sel".
-    p_msg->app_id = this_appid;
+    p_msg = ff_get_sock_msg( UP_WND_MSG, this_procid);
+    if ( unlikely(NULL==p_msg )){
+        return -1;
+    }
+    p_msg->app_id = sockinfo->app_id;
     p_msg->event = RX_WND_EV;
-    p_msg->mod_nb = mod;
-    p_msg->sock_fd = fd;
+    p_msg->mod_nb = len;		//  no use length, app read as much as can do.
+    p_msg->sock_fd = sockinfo->sock_fd;
 
-    if ( unlikely(ff_sendup_evt((void*) p_msg， g_fstk_ctl[this_procid].ff_up_ctl_r) != 1)){
-        RTE_LOG(INFO, sockmsg, "ff_tcp_input_ok enqueue failed." );        
+    if ( unlikely(FF_SENDUP_WNDMSG(p_msg) != 0)){
+        ff_free_sock_msg(DOWN_WND_MSG, this_procid, (void**)&p_msg, 1);
+        RTE_LOG(INFO, USER1, "ff_tcp_rwakeup enqueue failed." );        
         return -1;
     }
+    sockinfo->stk_wakeup_nb ++;
     return 0;
 }
 
-/*******************************************************App API***************************************************************/
-#define APP_SEND_DOWN_CTLMSG(obj) rte_ring_sp_enqueue( g_fstk_ctl[this_procid].ff_down_ctl_r,  (void*)obj )
-#define APP_SEND_DOWN_WNDMSG(obj) rte_ring_sp_enqueue( g_fstk_ctl[this_procid].ff_down_wnd_r,  (void*)obj )
-#define APP_RECV_UP_CTLMSG(obj) rte_ring_sc_dequeue( g_fstk_ctl[this_procid].ff_up_ctl_r,  (void**)obj)
-#define APP_RECV_UP_WNDMSG(obj) rte_ring_sc_dequeue( g_fstk_ctl[this_procid].ff_up_wnd_r,  (void**)obj)
-
-#define THIS_SOCK_EVT_FD    g_fstk_ctl[this_appid].sock_evtfd
-#define THIS_SOCK_EPOLL_FD  g_fstk_ctl[this_appid].sock_epfd
-
-#define APP_EPOLL_TIMEOUT   10
-#define APP_EPOLL_EVENTS    2
-
-int ff_app_sync( int fd, int timeout ){
-    struct epoll_event evs[APP_EPOLL_EVENTS] = {0};
-    int val = 0;
-    int rc = epoll_wait(fd, &evs, APP_EPOLL_EVENTS, timeout);
-    if ( likely( rc>1 ) ){
-        eventfd_read(fd, &val);
-        return val;
-    }
-    if ( unlikely(rc < 0) ){
-        RTE_LOG(INFO, appsock, "epoll_wait failed errno %d!\n", errno);
-        return -1;
-    }
-
-    return 0;
-}
-
-/*********************************************************
- * app send SOCKET_EV to fstack, and waiting the response msg.
- * Sync Api
- * ******************************************************/
-int ff_app_socket(int domain, int type, int protocol){
-    int32_t fd = -1;
-    struct s_ff_ctl_msg* req = ff_get_sock_msg(DOWN_CTL_MSG, this_procid);
-    struct s_ff_ctl_msg** rsp = NULL;
-
-    req->app_id = this_appid;
-    req->event = SOCKET_EV;
-    req->sock_fd = -1;
-    req->req.sock_req.domain = domain;
-    req->req.sock_req.type = type;
-    req->req.sock_req.protocol = protocol;
-
-    if ( APP_SEND_DOWN_CTLMSG(req)!= 1)
-        return -1;
-    fd = ff_app_sync(THIS_SOCK_EPOLL_FD, APP_EPOLL_TIMEOUT ) ;
-    if ( unlikely( fd<=0 ) ){
-        ff_free_sock_msg(UP_CTL_MSG, this_procid, &req, 1);
-        return -1;
-    }
-    APP_RECV_UP_CTLMSG(rsp);
-    ff_free_sock_msg(UP_CTL_MSG, this_procid, rsp, 1 );
-    return fd;
-}
-
-/*********************************************************
- * app send BIND_EV to fstack, and waiting the response msg.
- * not support  PR_ADDR/MSG_PEEK/MT_CONTROL/MSG_SOCALLBCK/MSG_WAITALL  
- * ******************************************************/
-int ff_app_bind(int s, const struct sockaddr *addr, socklen_t addrlen){
-    struct s_ff_ctl_msg** rsp = NULL;
-    struct s_ff_ctl_msg* req = ff_get_sock_msg(DOWN_CTL_MSG, this_procid);
-    int ret = 0;
-
-    req->app_id = this_appid;
-    req->event = BIND_EV;
-    req->sock_fd = s;
-    memcpy(req->req.bind_req.l_addr, addr, addrlen);
-    req->req.bind_req.len =  addrlen;
-
-    if ( APP_SEND_DOWN_CTLMSG(req) != 1)
-        ret = -1;
-    if ( unlikely( ff_app_sync(this_appid) <=0 ) )
-        ret = -1;
+#define __COMM_FUNC_
+// define some common functions that can be called by up/down layer.
+// this source belongs to FF_HOST_SRCS, should be compiled with fault headers, linked with system libs.
+// can't be linked with bsd functions, can be linked with dpdk functions.
+// using C++ stl containers may be better.
+int stklist_init(StackList_t*p, int size){
+    int i = 0;
     
-    APP_RECV_UP_CTLMSG(rsp);
-    if ( unlikely( *rsp->event != SOCKET_EV || *rsp->rsp.op_rsp.result < 0 )  )
-        ret = -1;
-
-    ff_free_sock_msg(UP_CTL_MSG, this_procid, rsp, 1 );
-    return ret;
+    if (p==NULL || size<=0){
+        return -1;
+    }
+    p->size = size;
+    p->top = 0;
+    if ( posix_memalign((void**)&p->ele, sizeof(uint64_t), sizeof(uint64_t)*size) != 0)
+        return -2;
+    
+    return 0;
 }
-
-/*************************
- * app open a passive socket, return 
- * return code: >0 means socket fd;  <=0 means failed.
- * **********************/
-int ff_app_connect()
+uint64_t stklist_pop(StackList_t *p)
 {
-    // send open+connect op msg to fstack.
-    struct s_ff_ctl_msg** rsp = NULL;
-    struct s_ff_ctl_msg* req = ff_get_sock_msg(DOWN_CTL_MSG, this_procid);
-    int ret = 0;
+    if (p==NULL)
+        return (uint64_t)-1;
 
-    req->app_id = this_appid;
-    req->event = CONNECT_EV;
-    req->sock_fd = s;
-    memcpy(req->req.bind_req.l_addr, addr, addrlen);
-    req->req.bind_req.len =  addrlen;
-
-    if ( APP_SEND_DOWN_CTLMSG(req) != 1)
-        ret = -1;
-    
-    return ret;
+    if (p->top > 0 ){
+        return (uint64_t)p->ele[--p->top];
+    }
+    else
+        return (uint64_t)-1;
 }
 
-/*********************************************************
- * app send LISTEN_EV to fstack and return.
- * 
- * ******************************************************/
-int ff_app_listen(int s, int backlog){
-    struct s_ff_ctl_msg* rsp = NULL;
-    struct s_ff_ctl_msg* req = ff_get_sock_msg(DOWN_CTL_MSG, this_procid);
-
-    req->app_id = this_appid;
-    req->event = LISTEN_EV;
-    req->sock_fd = s;
-    req->req.listen_req.backlog = backlog;
+//id: the id of element to be freed.
+//return code: -1: faile;  >=0:OK.
+int stklist_push(StackList_t *p,  const uint64_t val){
+    int tail = 0;
     
-    if (rte_ring_enqueue( g_fstk_ctl[this_procid].ff_down_ring,  (void*)req ) != 1)
+    if (p==NULL)
         return -1;
-    
-    return 0;
+    if (p->top < p->size){
+        p->ele[p->top++] = val;
+        return 0;
+    }
+    else
+        return -1;
+}
+int stklist_size(StackList_t * p){
+    return p->size;
 }
 
-int ff_app_epolladd( int s, int epollfd ){
-    struct epoll_event ev = {0};
-
-    ev.events = EPOLLIN|EPOLLERR;
-    ev.data.u32 = appid;
-    if (epoll_ctl(g_app_ctl[appid].ep_fd, EPOLL_CTL_ADD, g_app_ctl[appid].evt_fd, &ev) <0 ){
-        rte_panic("epoll_ctl failed errno %d!\n", errno);
+int InitDgramSock(UnixSock_t* pSock, const char* path, 
+        uint32_t blocked, uint32_t bufsz)
+{
+    int clt_fd,ret, flag;
+    socklen_t len ;
+    struct sockaddr_un *SockAddr;
+    int sendBufSize ;
+    
+    pSock->sockfd = socket(AF_UNIX,SOCK_DGRAM,0);
+    if(pSock->sockfd == -1)
+    {
         return -1;
     }
-}
 
-#define MAX_EVENT_NUM     2048
-struct epoll_event  g_epoll_event[MAX_EVENT_NUM] = {0};
-
-/************************************************************************
- * Get one bulk item from up ring.
- * 
- * *********************************************************************/
-static inline int ff_app_get_evts(struct epoll_event *events, int maxevents){
-    struct s_ff_wnd_msg* objs[MAX_EVENT_NUM];
-    uint32_t num, i, evt_id = 0, bulknum;
-
-    bulknum = (maxevents > MAX_EVENT_NUM) ? MAX_EVENT_NUM : maxevents;
-    num = rte_ring_dequeue_burst(g_fstk_ctl[this_appid].ff_up_wnd_r, (void* const *)&objs, maxevents, NULL);
-    for(i=0; i<num; i+=4){
-        events[evt_id++].events = objs[i]->event;
-        events[evt_id++].data.fd = objs[i]->sock_fd;
-
-        events[evt_id++].events = objs[i+1]->event;
-        events[evt_id++].data.fd = objs[i+1]->sock_fd;
-
-        events[evt_id++].events = objs[i+2]->event;
-        events[evt_id++].data.fd = objs[i+2]->sock_fd;
-
-        events[evt_id++].events = objs[i+3]->event;
-        events[evt_id++].data.fd = objs[i+3]->sock_fd;
+    unlink(path);
+    SockAddr = &pSock->addr;
+    memset(SockAddr,0,sizeof(struct sockaddr_un));
+    SockAddr->sun_family = AF_UNIX ;
+    memset(SockAddr->sun_path, 0, sizeof(SockAddr->sun_path));
+    strncpy(SockAddr->sun_path, path, sizeof(SockAddr->sun_path)-1);
+    ret = bind(pSock->sockfd, (struct sockaddr*)SockAddr, 
+                sizeof(struct sockaddr_un));
+    if(ret == -1)
+    {
+        close(pSock->sockfd);
+        return -2;
     }
-    for( i-=4; i<num; i++){
-        events[evt_id++].events = objs[i]->event;
-        events[evt_id++].data.fd = objs[i]->sock_fd;
+    if ( !blocked ){
+        flag = fcntl(pSock->sockfd, F_GETFL, 0);
+        if (fcntl(pSock->sockfd, F_SETFL, flag | O_NONBLOCK) == -1){
+            close(pSock->sockfd);
+            return -3;
+        }
     }
-    ff_free_sock_msg(UP_WND_MSG, &objs, num);
-    return num;
-}
-
-/*********************************************************************
- * maxevents shoud be multi*4
- * App must recv all the bytes in specific socket's rx buffer. 
- * Only when one socket gets one packet into empty rx buffer, event signal will be sent.
- * *******************************************************************/
-int ff_app_epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout_ms){
-    uint32_t num;
     
-    num = ff_app_get_evts(events, maxevents);
-    if ( unlikeyly( !num )  )
-        ff_app_sync(this_appid, timeout_ms);
-    num = ff_app_get_evts(events, maxevents);
-
-    return num;
-}
-
-/************************************************
- * app copy data from rx buffer as much as 
- * flags must be zero.
- * *********************************************/
-static inline int ff_app_copy_stream(void* buf, size_t len, struct sockbuf* sb){
-    struct uio auio;
-    struct iovec iov;
-    uint32_t o_len = 0;
-
-    iov.iov_base = buf;
-    iov.iov_len = len;
-
-    auio.uio_iov = &iov;
-	auio.uio_iovcnt = 1;
-	auio.uio_segflg = UIO_USERSPACE;
-	auio.uio_rw = UIO_READ;
-	auio.uio_td = curthread;
-	auio.uio_offset = 0;
-	auio.uio_resid = len;
-
-    o_len = min(len, sbavail(sb));
-    if ( unlikely(m_mbuftouio(auio, sb->sb_mb, o_len)) ){
-        return -1;
+    if ( bufsz > 0 ){
+        len=sizeof(sendBufSize);
+        sendBufSize = bufsz ;
+        ret=setsockopt(pSock->sockfd,SOL_SOCKET,SO_SNDBUF,&sendBufSize,len);
+        if(ret==-1){
+            close(pSock->sockfd);
+            return -4;
+        }
     }
-    // m_freem(sbcut_internal(sb, len));   // fstack should do this op.
-    return o_len;
+
+    return 0;  
+}
+void InitUnixAddr(struct sockaddr_un *addr, const char* path, unsigned int len)
+{
+	if (addr==NULL || len >= sizeof(addr->sun_path))
+	{
+		return;
+	}
+	addr->sun_family = AF_UNIX ;
+    strncpy(addr->sun_path, path, sizeof(addr->sun_path));
+    addr->sun_path[sizeof(addr->sun_path)-1] = 0;
 }
 
-static inline int ff_app_send_wndmsg(int fd, int evt, uint32_t mod ){
-    struct s_ff_wnd_msg* wnd_msg = ff_get_sock_msg( DOWN_WND_MSG, this_procid );
-    wnd_msg->sock_fd = this_appid;
-    wnd_msg->event = evt;
-    wnd_msg->sock_fd = fd;
-    wnd_msg->mod_nb = mod; 
-    rte_ring_sp_enqueue(g_fstk_ctl[this_procid].ff_down_ring, (void*) wnd_msg);
-    return 0;
+int UxSktSend(int sockfd, struct sockaddr_un* remote, char* data, unsigned int datalen)
+{
+	int sendsize = 0;
+	int len = 0;
+
+	if (sockfd<=0 || remote==NULL)
+	{
+		return -1;
+	}
+	len = sizeof(struct sockaddr_un);
+	sendsize = sendto(sockfd, data, datalen, 0, (struct sockaddr*)remote, len);
+	/*
+    if (sendsize < 0 )
+	{
+		SleepUs(5);
+		sendsize = sendto(sockfd, data, datalen, 0, (struct sockaddr*)remote, len);
+	}
+    */
+	return sendsize;
 }
 
-/************************************************
- * app copy data from rx, send rx_wnd event to fstack.
- * flags must be zero.
- * *********************************************/
-int ff_app_recv( int s, void *buf, size_t len, int flags ){
-    int32_t o_len = 0;
+int UxSktRecv(int sockfd, struct sockaddr_un* remote, char* data, unsigned int datalen)
+{
+	int recvsize = 0;
+	int len = 0;
 
-    struct socket* so = ff_get_sock_obj(fd);
-    RTE_ASSERT(so!=NULL);
-    struct sockbuf* rx_sb = &so->so_rcv;
-    RTE_ASSERT(rx_sb!=NULL);
-
-    o_len = ff_app_copy_stream(buf, size, rx_sb);
-    if (  unlikely( o_len<0)  )
-        return -1;
-    ff_app_send_wndmsg(s, RX_WND_EV, o_len);
-    return o_len;
+	if (sockfd<=0 || remote==NULL )
+	{
+		return -1;
+	}
+	len = sizeof(struct sockaddr_un);
+	recvsize = recvfrom(sockfd, data, datalen, 0, (struct sockaddr*)remote, (socklen_t*)&len);
+	if (recvsize == -1)
+	{
+		if (errno != EINTR && errno != ECONNABORTED && errno != EAGAIN && errno != ENOBUFS && errno != EWOULDBLOCK && errno != EPROTO)
+		{
+			return -2;
+		}
+	}
+	return recvsize;
 }
+
+static int cal_exp (unsigned long size)
+{
+	unsigned long i = 1;
+	int j = 0;
+
+	while(i < size) {
+		i *= 2;
+		j ++;
+	}
+	return (i);
+}
+
+/**********************
+ ����ѭ�����е�ʵ�ʿռ䳤�ȣ� 
+ ʵ�ʿռ�Ӧ���ǲ�С�� ���size����С 2�ݡ�
+**********************/
+int CList_init(CList_t *p, int size)
+{
+	int i = 0;
+	int len = 0;
+	
+	if (p==NULL || size<=0)
+	{
+		return -1;
+	}
+	len = cal_exp(size);
+	//p->ele = (int*)malloc(sizeof(int)*size);
+	posix_memalign((void**)&p->ele, BITS_SIZE, size*sizeof(long));
+	if (p->ele == NULL)
+		return -2;
+	
+	p->Head = p->Tail = 0;
+	p->size = len;
+	
+	return p->size;
+}
+
+//  ��ȡѭ�����еĿ�����Դ����
+int CList_GetLen(CList_t *p)
+{
+	int head, tail;
+	
+	if(p==NULL)
+		return -1;
+	head = p->Head;
+	tail = p->Tail;
+	return  ((tail - head + p->size) & (p->size -1));
+}
+
+int CList_IsEmpty(CList_t *p)
+{
+	return  p->Head == p->Tail;
+}
+
+int CList_IsFull(CList_t *p)
+{
+	return  p->Head == ((p->Tail + 1) & (p->size -1)) ;
+}
+
+//return code: -1: faile;  >=0:OK.
+int CList_Pop(CList_t *p)
+{
+	int head = 0;
+	
+	if(p==NULL)
+		return -1;
+
+	if ( !CList_IsEmpty(p))
+	{
+		head = p->Head;		
+		p->Head = (p->Head + 1) & (p->size-1);
+		return p->ele[head];
+	}
+	else
+		return -1;
+}
+
+//id: the id of element to be push into list.
+//return code: -1: faile;  >=0:OK.
+int CList_Push(CList_t *p, long val)
+{
+	int tail = 0;
+	
+	if(p==NULL)
+		return -1;
+	if ( !CList_IsFull(p) )
+	{
+		tail = p->Tail;
+		p->ele[tail] = val;
+		p->Tail = (p->Tail + 1) & (p->size-1);
+		
+		return 0;
+	}
+	else
+		return -1;
+}
+
+inline int CList_GetSize(CList_t *p)
+{
+	if(p==NULL)
+		return -1;
+	return p->size;
+}
+
+
+
 

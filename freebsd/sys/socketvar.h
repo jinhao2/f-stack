@@ -256,6 +256,7 @@ struct xsocket {
  * directly invokes the underlying sowakeup() primitives, it must
  * maintain the same semantics.
  */
+
 #define	sorwakeup_locked(so) do {					\
 	SOCKBUF_LOCK_ASSERT(&(so)->so_rcv);				\
 	if (sb_notify(&(so)->so_rcv))					\
@@ -406,6 +407,7 @@ void	sowakeup(struct socket *so, struct sockbuf *sb);
 void	sowakeup_aio(struct socket *so, struct sockbuf *sb);
 int	selsocket(struct socket *so, int events, struct timeval *tv,
 	    struct thread *td);
+void ff_sorwakeup_locked(struct socket* so);
 
 /*
  * Accept filter functions (duh).

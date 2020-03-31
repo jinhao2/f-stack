@@ -438,4 +438,33 @@ mutex_init(void)
     mtx_init(&Giant, "Giant", NULL, MTX_DEF | MTX_RECURSE);
     mtx_init(&proc0.p_mtx, "process lock", NULL, MTX_DEF | MTX_DUPOK);
 }
+/*
+void ff_mutex_lock(ff_mutex_t *sl)
+{
+	int lock_val = 1;
+	__asm__ volatile (
+			"1:\n"
+			"xchg %[locked], %[lv]\n"
+			"test %[lv], %[lv]\n"
+			"jz 3f\n"
+			"2:\n"
+			"pause\n"
+			"cmpl $0, %[locked]\n"
+			"jnz 2b\n"
+			"jmp 1b\n"
+			"3:\n"
+			: [locked] "=m" (sl->locked), [lv] "=q" (lock_val)
+			: "[lv]" (lock_val)
+			: "memory");
+}
 
+void ff_mutex_unlock(ff_mutex_t* sl)
+{
+	int unlock_val = 0;
+	__asm__ volatile (
+			"xchg %[locked], %[ulv]\n"
+			: [locked] "=m" (sl->locked), [ulv] "=q" (unlock_val)
+			: "[ulv]" (unlock_val)
+			: "memory");
+}
+*/

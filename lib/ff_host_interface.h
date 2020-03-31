@@ -25,9 +25,10 @@
  *
  * Derived in part from libuinet's uinet_host_interface.h.
  */
+// functions wrapped libc codes, this codes must be compiled with libc codes.
 
 #ifndef _FSTACK_HOST_INTERFACE_H_
-#define _FSTACK_HOST_INTERFACE_H_
+#define _FSTACK_HOST_INTERFACE_H_0
 
 #define ff_PROT_NONE     0x00
 #define ff_PROT_READ     0x01

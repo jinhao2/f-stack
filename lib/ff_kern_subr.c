@@ -119,6 +119,7 @@ uiomove(void *cp, int n, struct uio *uio)
 
     KASSERT(uio->uio_rw == UIO_READ || uio->uio_rw == UIO_WRITE,
         ("uiomove: mode"));
+/*** 
     KASSERT(uio->uio_segflg != UIO_USERSPACE || uio->uio_td == curthread,
         ("uiomove proc"));
     WITNESS_WARN(WARN_GIANTOK | WARN_SLEEPOK, NULL,
@@ -126,6 +127,7 @@ uiomove(void *cp, int n, struct uio *uio)
 
     save = td->td_pflags & TDP_DEADLKTREAT;
     td->td_pflags |= TDP_DEADLKTREAT;
+***/
 
     while (n > 0 && uio->uio_resid) {
         iov = uio->uio_iov;
@@ -168,8 +170,10 @@ uiomove(void *cp, int n, struct uio *uio)
         n -= cnt;
     }
 out:
+/*****
     if (save == 0)
         td->td_pflags &= ~TDP_DEADLKTREAT;
+*****/
     return (error);
 }
 

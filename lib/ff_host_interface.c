@@ -38,6 +38,13 @@
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#include <sys/un.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include <openssl/rand.h>
 #include <rte_malloc.h>

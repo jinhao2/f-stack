@@ -126,6 +126,9 @@ static struct ff_dpdk_if_context *veth_ctx[RTE_MAX_ETHPORTS];
 static struct ff_top_args ff_top_status;
 static struct ff_traffic_args ff_traffic;
 extern void ff_hardclock(void);
+extern void ff_proc_ctl_ring();
+extern void ff_proc_wnd_ring();
+extern int ff_init_socket_info(int i);
 
 static void
 ff_hardclock_job(__rte_unused struct rte_timer *timer,
@@ -842,6 +845,7 @@ ff_dpdk_init(int argc, char **argv)
         init_kni();
     }
 #endif
+    ff_init_socket_info(0);
 
 #ifdef FF_USE_PAGE_ARRAY
     ff_mmap_init();
@@ -1609,7 +1613,11 @@ main_loop(void *arg)
             lr->loop(lr->arg);
         }
 *****/
-        ff_proc_down_ring();
+        ff_proc_wnd_ring();
+        if ( unlikely( cur_tsc - usch_tsc >= drain_tsc)) {
+            usch_tsc = cur_tsc;
+            ff_proc_ctl_ring();
+        }
         idle_sleep_tsc = rte_rdtsc();
         if (likely(idle && idle_sleep)) {
             usleep(idle_sleep);
